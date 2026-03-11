@@ -1,0 +1,94 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  workflow_dispatch:
+
+env:
+  IMAGE_REPO: ${{ vars.OPENFANG_IMAGE_REPO }}
+  DEPLOY_PATH: ${{ vars.OPENFANG_DEPLOY_PATH }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate registry config
+        run: |
+          test -n "$IMAGE_REPO"
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            image_tag="${GITHUB_REF_NAME}"
+          else
+            image_tag="${GITHUB_SHA}"
+          fi
+          echo "image=${IMAGE_REPO}:${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "latest=${IMAGE_REPO}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to registry
+        run: |
+          printf '%s' '${{ secrets.GITHUB_TOKEN }}' | \
+            docker login "$(printf '%s' "$IMAGE_REPO" | cut -d/ -f1)" \
+              -u '${{ github.actor }}' \
+              --password-stdin
+
+      - name: Build and push image
+        run: |
+          docker build -t '${{ steps.meta.outputs.image }}' -t '${{ steps.meta.outputs.latest }}' .
+          docker push '${{ steps.meta.outputs.image }}'
+          docker push '${{ steps.meta.outputs.latest }}'
+
+  deploy:
+    if: github.ref_type == 'branch' && github.ref_name == 'main'
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate deploy config
+        run: |
+          test -n "$DEPLOY_PATH"
+          test -n "${{ secrets.OPENFANG_DEPLOY_HOST }}"
+          test -n "${{ secrets.OPENFANG_DEPLOY_USER }}"
+          test -n "${{ secrets.OPENFANG_DEPLOY_SSH_KEY }}"
+
+      - name: Configure SSH
+        env:
+          DEPLOY_PORT: ${{ secrets.OPENFANG_DEPLOY_PORT }}
+        run: |
+          port="${DEPLOY_PORT:-22}"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' '${{ secrets.OPENFANG_DEPLOY_SSH_KEY }}' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$port" '${{ secrets.OPENFANG_DEPLOY_HOST }}' >> ~/.ssh/known_hosts
+
+      - name: Upload deployment bundle
+        env:
+          DEPLOY_PORT: ${{ secrets.OPENFANG_DEPLOY_PORT }}
+        run: |
+          port="${DEPLOY_PORT:-22}"
+          tar --exclude='.env' -C deploy/docker -cf - . | \
+            ssh -p "$port" \
+              '${{ secrets.OPENFANG_DEPLOY_USER }}@${{ secrets.OPENFANG_DEPLOY_HOST }}' \
+              "mkdir -p '$DEPLOY_PATH' && tar -xf - -C '$DEPLOY_PATH'"
+
+      - name: Deploy remote stack
+        env:
+          DEPLOY_PORT: ${{ secrets.OPENFANG_DEPLOY_PORT }}
+        run: |
+          port="${DEPLOY_PORT:-22}"
+          ssh -p "$port" \
+            '${{ secrets.OPENFANG_DEPLOY_USER }}@${{ secrets.OPENFANG_DEPLOY_HOST }}' \
+            "cd '$DEPLOY_PATH' && chmod +x deploy.sh && OPENFANG_IMAGE='${{ needs.publish.outputs.image }}' ./deploy.sh"

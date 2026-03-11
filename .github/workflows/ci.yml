@@ -136,3 +136,15 @@ jobs:
         run: |
           curl -fsSL https://openfang.sh/install.ps1 -o /tmp/install.ps1
           pwsh -NoProfile -Command "Get-Content /tmp/install.ps1 | Out-Null" 2>&1 || true
+
+  docker-deploy:
+    name: Docker Deploy Stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose bundle
+        run: docker compose -f deploy/docker/compose.yaml config
+      - name: Build deployment image
+        run: docker compose -f deploy/docker/compose.yaml -f deploy/docker/compose.build.yaml build openfang
+      - name: Validate deploy script
+        run: bash -n deploy/docker/deploy.sh
