@@ -14,6 +14,6 @@ if [[ -z "${OPENFANG_IMAGE:-}" ]]; then
   exit 1
 fi
 
-docker compose pull openfang caddy
+docker compose pull openfang
 docker compose up -d
 docker compose ps

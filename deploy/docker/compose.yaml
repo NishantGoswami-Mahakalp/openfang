@@ -10,38 +10,14 @@ services:
     volumes:
       - openfang-data:/data
       - ./config.toml:/data/config.toml:ro
-    expose:
-      - "4200"
+    ports:
+      - "127.0.0.1:4200:4200"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4200/api/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 45s
-    networks:
-      - fang
-
-  caddy:
-    image: caddy:2
-    container_name: caddy-fang
-    restart: unless-stopped
-    depends_on:
-      - openfang
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    networks:
-      - fang
 
 volumes:
   openfang-data:
-  caddy-data:
-  caddy-config:
-
-networks:
-  fang:
-    driver: bridge
