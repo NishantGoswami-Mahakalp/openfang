@@ -12,6 +12,7 @@ env:
 
 jobs:
   publish:
+    environment: CorpStack-GER-01
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.meta.outputs.image }}
@@ -50,6 +51,7 @@ jobs:
   deploy:
     if: github.ref_type == 'branch' && github.ref_name == 'deploy/vps'
     needs: publish
+    environment: CorpStack-GER-01
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
