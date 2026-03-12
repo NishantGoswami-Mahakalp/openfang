@@ -17,6 +17,7 @@
 
 # User config (may contain API keys)
 config.toml
+!deploy/docker/config.toml
 
 # Certificates & keys
 *.pem

@@ -15,7 +15,7 @@ if [[ -z "${OPENFANG_IMAGE:-}" ]]; then
 fi
 
 docker compose pull openfang
-docker compose up -d
+docker compose up -d --force-recreate openfang
 for _ in $(seq 1 20); do
   status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' openfang 2>/dev/null || true)"
   if [[ "$status" == "healthy" || "$status" == "running" ]]; then
