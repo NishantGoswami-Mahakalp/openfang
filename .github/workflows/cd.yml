@@ -3,9 +3,7 @@ name: CD
 on:
   push:
     branches:
-      - main
-    tags:
-      - v*
+      - deploy/vps
   workflow_dispatch:
 
 env:
@@ -50,7 +48,7 @@ jobs:
           docker push '${{ steps.meta.outputs.latest }}'
 
   deploy:
-    if: github.ref_type == 'branch' && github.ref_name == 'main'
+    if: github.ref_type == 'branch' && github.ref_name == 'deploy/vps'
     needs: publish
     runs-on: ubuntu-latest
     steps:
