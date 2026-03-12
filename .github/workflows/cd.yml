@@ -82,7 +82,7 @@ jobs:
           tar --exclude='.env' -C deploy/docker -cf - . | \
             ssh -p "$port" \
               '${{ secrets.OPENFANG_DEPLOY_USER }}@${{ secrets.OPENFANG_DEPLOY_HOST }}' \
-              "mkdir -p '$DEPLOY_PATH' && tar -xf - -C '$DEPLOY_PATH'"
+              "mkdir -p '$DEPLOY_PATH' && rm -rf '$DEPLOY_PATH/config.toml' '$DEPLOY_PATH/Caddyfile' && tar -xf - -C '$DEPLOY_PATH'"
 
       - name: Deploy remote stack
         env:

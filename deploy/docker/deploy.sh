@@ -16,4 +16,16 @@ fi
 
 docker compose pull openfang
 docker compose up -d
-docker compose ps
+for _ in $(seq 1 20); do
+  status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' openfang 2>/dev/null || true)"
+  if [[ "$status" == "healthy" || "$status" == "running" ]]; then
+    docker compose ps
+    exit 0
+  fi
+  sleep 3
+done
+
+docker compose ps >&2
+docker logs --tail 80 openfang >&2 || true
+printf 'OpenFang failed to become healthy\n' >&2
+exit 1
