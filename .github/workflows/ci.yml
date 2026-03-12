@@ -71,9 +71,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare deployment env
+        run: cp deploy/docker/.env.example deploy/docker/.env
       - name: Validate compose bundle
         run: docker compose -f deploy/docker/compose.yaml config
       - name: Build deployment image
         run: docker compose -f deploy/docker/compose.yaml -f deploy/docker/compose.build.yaml build openfang
       - name: Validate deploy script
         run: bash -n deploy/docker/deploy.sh
+      - name: Clean deployment env
+        if: always()
+        run: rm -f deploy/docker/.env
