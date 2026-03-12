@@ -316,12 +316,8 @@ impl ChannelAdapter for SlackAdapter {
                     .await?;
             }
             _ => {
-                self.api_send_message(
-                    channel_id,
-                    "(Unsupported content type)",
-                    Some(thread_id),
-                )
-                .await?;
+                self.api_send_message(channel_id, "(Unsupported content type)", Some(thread_id))
+                    .await?;
             }
         }
         Ok(())
