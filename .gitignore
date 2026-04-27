@@ -35,6 +35,7 @@ BUILD_LOG.md
 
 # OS
 .DS_Store
+._*
 Thumbs.db
 
 # IDE & tools
@@ -44,3 +45,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+.serena/
+
+# Personal deploy scripts
+scripts/deploy-remote.sh

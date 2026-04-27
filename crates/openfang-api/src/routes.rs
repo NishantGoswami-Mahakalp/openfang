@@ -1,7 +1,7 @@
 //! Route handlers for the OpenFang API.
 
 use crate::types::*;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -40,6 +40,9 @@ pub struct AppState {
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
     pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
+    /// Thread-safe mutable budget config. Updated via PUT /api/budget.
+    /// Initialized from `kernel.config.budget` at startup.
+    pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -144,13 +147,19 @@ pub async fn spawn_agent(
 
     let name = manifest.name.clone();
     match state.kernel.spawn_agent(manifest) {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!(SpawnResponse {
-                agent_id: id.to_string(),
-                name,
-            })),
-        ),
+        Ok(id) => {
+            // Register in channel router so binding resolution finds the new agent
+            if let Some(ref mgr) = *state.bridge_manager.lock().await {
+                mgr.router().register_agent(name.clone(), id);
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!(SpawnResponse {
+                    agent_id: id.to_string(),
+                    name,
+                })),
+            )
+        }
         Err(e) => {
             tracing::warn!("Spawn failed: {e}");
             (
@@ -352,26 +361,42 @@ pub async fn send_message(
         );
     }
 
-    // Resolve file attachments into image content blocks
-    if !req.attachments.is_empty() {
+    // Resolve file attachments into image content blocks.
+    // Pass them as content_blocks so the LLM receives them in the current turn
+    // (not as a separate session message which the LLM may not process).
+    let content_blocks = if !req.attachments.is_empty() {
         let image_blocks = resolve_attachments(&req.attachments);
-        if !image_blocks.is_empty() {
-            inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
+        if image_blocks.is_empty() {
+            None
+        } else {
+            Some(image_blocks)
         }
-    }
+    } else {
+        None
+    };
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
-        .send_message_with_handle(agent_id, &req.message, Some(kernel_handle))
+        .send_message_with_handle_and_blocks(
+            agent_id,
+            &req.message,
+            Some(kernel_handle),
+            content_blocks,
+            req.sender_id,
+            req.sender_name,
+        )
         .await
     {
         Ok(result) => {
             // Strip <think>...</think> blocks from model output
             let cleaned = crate::ws::strip_think_tags(&result.response);
 
-            // Guard: ensure we never return an empty response to the client
-            let response = if cleaned.trim().is_empty() {
+            // If the agent intentionally returned a silent/NO_REPLY response,
+            // return an empty string — don't generate debug fallback text.
+            let response = if result.silent {
+                String::new()
+            } else if cleaned.trim().is_empty() {
                 format!(
                     "[The agent completed processing but returned no text response. ({} in / {} out | {} iter)]",
                     result.total_usage.input_tokens,
@@ -410,9 +435,16 @@ pub async fn send_message(
 }
 
 /// GET /api/agents/:id/session — Get agent session (conversation history).
+///
+/// Query parameters:
+/// - `include_system` — when `true`, system-role messages are included in the
+///   response (intended for debugging only). Defaults to `false` so the
+///   internal system prompt is never leaked into the Web UI conversation
+///   history (issue #935).
 pub async fn get_agent_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
@@ -423,6 +455,14 @@ pub async fn get_agent_session(
             );
         }
     };
+
+    // SECURITY (#935): Default to filtering out system-role messages so the
+    // internal system prompt is never exposed in the Web UI conversation
+    // history. Callers can opt-in via `?include_system=true` for debugging.
+    let include_system = params
+        .get("include_system")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "TRUE" | "True"))
+        .unwrap_or(false);
 
     let entry = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -436,6 +476,16 @@ pub async fn get_agent_session(
 
     match state.kernel.memory.get_session(entry.session_id) {
         Ok(Some(session)) => {
+            // Filter out system-role messages BEFORE any rendering / truncation
+            // logic so the system prompt cannot leak into the response. The
+            // raw message count is preserved separately for the API consumer.
+            let raw_message_count = session.messages.len();
+            let filtered_messages: Vec<&openfang_types::message::Message> = session
+                .messages
+                .iter()
+                .filter(|m| include_system || m.role != openfang_types::message::Role::System)
+                .collect();
+
             // Two-pass approach: ToolUse blocks live in Assistant messages while
             // ToolResult blocks arrive in subsequent User messages.  Pass 1
             // collects all tool_use entries keyed by id; pass 2 attaches results.
@@ -446,7 +496,8 @@ pub async fn get_agent_session(
             let mut tool_use_index: std::collections::HashMap<String, (usize, usize)> =
                 std::collections::HashMap::new();
 
-            for m in &session.messages {
+            for m in &filtered_messages {
+                let m = *m;
                 let mut tools: Vec<serde_json::Value> = Vec::new();
                 let mut msg_images: Vec<serde_json::Value> = Vec::new();
                 let content = match &m.content {
@@ -536,8 +587,8 @@ pub async fn get_agent_session(
                 built_messages.push(msg);
             }
 
-            // Pass 2: walk messages again and attach ToolResult to the correct tool
-            for m in &session.messages {
+            // Pass 2: walk filtered messages again and attach ToolResult to the correct tool
+            for m in &filtered_messages {
                 if let openfang_types::message::MessageContent::Blocks(blocks) = &m.content {
                     for b in blocks {
                         if let openfang_types::message::ContentBlock::ToolResult {
@@ -553,9 +604,8 @@ pub async fn get_agent_session(
                                         msg.get_mut("tools").and_then(|v| v.as_array_mut())
                                     {
                                         if let Some(tool_obj) = tools_arr.get_mut(tool_idx) {
-                                            let preview: String =
-                                                result.chars().take(2000).collect();
-                                            tool_obj["result"] = serde_json::Value::String(preview);
+                                            tool_obj["result"] =
+                                                serde_json::Value::String(result.clone());
                                             tool_obj["is_error"] =
                                                 serde_json::Value::Bool(*is_error);
                                         }
@@ -568,12 +618,16 @@ pub async fn get_agent_session(
             }
 
             let messages = built_messages;
+            // `message_count` reflects what the API actually returns (system
+            // messages excluded by default). `raw_message_count` is exposed
+            // for callers that need to know the underlying total.
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "session_id": session.id.0.to_string(),
                     "agent_id": session.agent_id.0.to_string(),
-                    "message_count": session.messages.len(),
+                    "message_count": messages.len(),
+                    "raw_message_count": raw_message_count,
                     "context_window_tokens": session.context_window_tokens,
                     "label": session.label,
                     "messages": messages,
@@ -628,6 +682,67 @@ pub async fn kill_agent(
             )
         }
     }
+}
+
+/// POST /api/agents/{id}/restart — Restart a crashed/stuck agent.
+///
+/// Cancels any active task, resets agent state to Running, and updates last_active.
+/// Returns the agent's new state.
+pub async fn restart_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    // Check agent exists
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            );
+        }
+    };
+
+    let agent_name = entry.name.clone();
+    let previous_state = format!("{:?}", entry.state);
+    drop(entry);
+
+    // Cancel any running task
+    let was_running = state.kernel.stop_agent_run(agent_id).unwrap_or(false);
+
+    // Reset state to Running (also updates last_active)
+    let _ = state
+        .kernel
+        .registry
+        .set_state(agent_id, openfang_types::agent::AgentState::Running);
+
+    tracing::info!(
+        agent = %agent_name,
+        previous_state = %previous_state,
+        task_cancelled = was_running,
+        "Agent restarted via API"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "restarted",
+            "agent": agent_name,
+            "agent_id": id,
+            "previous_state": previous_state,
+            "task_cancelled": was_running,
+        })),
+    )
 }
 
 /// GET /api/status — Kernel status.
@@ -765,7 +880,26 @@ pub async fn create_workflow(
         created_at: chrono::Utc::now(),
     };
 
-    let id = state.kernel.register_workflow(workflow).await;
+    let id = state.kernel.register_workflow(workflow.clone()).await;
+
+    // Persist workflow to disk so it survives daemon restarts (#751)
+    let wf_dir = state
+        .kernel
+        .config
+        .workflows_dir
+        .clone()
+        .unwrap_or_else(|| state.kernel.config.home_dir.join("workflows"));
+    if let Err(e) = std::fs::create_dir_all(&wf_dir) {
+        tracing::warn!("Failed to create workflows dir: {e}");
+    } else {
+        let wf_path = wf_dir.join(format!("{}.json", id));
+        if let Ok(json) = serde_json::to_string_pretty(&workflow) {
+            if let Err(e) = std::fs::write(&wf_path, json) {
+                tracing::warn!("Failed to persist workflow {id}: {e}");
+            }
+        }
+    }
+
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"workflow_id": id.to_string()})),
@@ -847,6 +981,172 @@ pub async fn list_workflow_runs(
         })
         .collect();
     Json(list)
+}
+
+/// GET /api/workflows/:id — Get a single workflow by ID.
+pub async fn get_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid workflow ID"})),
+            );
+        }
+    });
+
+    match state.kernel.workflows.get_workflow(workflow_id).await {
+        Some(w) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": w.id.to_string(),
+                "name": w.name,
+                "description": w.description,
+                "steps": w.steps,
+                "created_at": w.created_at.to_rfc3339(),
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Workflow not found"})),
+        ),
+    }
+}
+
+/// PUT /api/workflows/:id — Update a workflow definition.
+pub async fn update_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid workflow ID"})),
+            );
+        }
+    });
+
+    let name = req["name"].as_str().unwrap_or("unnamed").to_string();
+    let description = req["description"].as_str().unwrap_or("").to_string();
+
+    let steps_json = match req["steps"].as_array() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'steps' array"})),
+            );
+        }
+    };
+
+    let mut steps = Vec::new();
+    for s in steps_json {
+        let step_name = s["name"].as_str().unwrap_or("step").to_string();
+        let agent = if let Some(id) = s["agent_id"].as_str() {
+            StepAgent::ById { id: id.to_string() }
+        } else if let Some(name) = s["agent_name"].as_str() {
+            StepAgent::ByName {
+                name: name.to_string(),
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": format!("Step '{}' needs 'agent_id' or 'agent_name'", step_name)}),
+                ),
+            );
+        };
+
+        let mode = match s["mode"].as_str().unwrap_or("sequential") {
+            "fan_out" => StepMode::FanOut,
+            "collect" => StepMode::Collect,
+            "conditional" => StepMode::Conditional {
+                condition: s["condition"].as_str().unwrap_or("").to_string(),
+            },
+            "loop" => StepMode::Loop {
+                max_iterations: s["max_iterations"].as_u64().unwrap_or(5) as u32,
+                until: s["until"].as_str().unwrap_or("").to_string(),
+            },
+            _ => StepMode::Sequential,
+        };
+
+        let error_mode = match s["error_mode"].as_str().unwrap_or("fail") {
+            "skip" => ErrorMode::Skip,
+            "retry" => ErrorMode::Retry {
+                max_retries: s["max_retries"].as_u64().unwrap_or(3) as u32,
+            },
+            _ => ErrorMode::Fail,
+        };
+
+        steps.push(WorkflowStep {
+            name: step_name,
+            agent,
+            prompt_template: s["prompt"].as_str().unwrap_or("{{input}}").to_string(),
+            mode,
+            timeout_secs: s["timeout_secs"].as_u64().unwrap_or(120),
+            error_mode,
+            output_var: s["output_var"].as_str().map(String::from),
+        });
+    }
+
+    let updated = Workflow {
+        id: workflow_id,
+        name,
+        description,
+        steps,
+        created_at: chrono::Utc::now(), // preserved by engine
+    };
+
+    if state
+        .kernel
+        .workflows
+        .update_workflow(workflow_id, updated)
+        .await
+    {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "updated", "workflow_id": id})),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Workflow not found"})),
+        )
+    }
+}
+
+/// DELETE /api/workflows/:id — Delete a workflow definition.
+pub async fn delete_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid workflow ID"})),
+            );
+        }
+    });
+
+    if state.kernel.workflows.remove_workflow(workflow_id).await {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "removed", "workflow_id": id})),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Workflow not found"})),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,21 +1464,24 @@ pub async fn send_message_stream(
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    let (rx, _handle) =
-        match state
-            .kernel
-            .send_message_streaming(agent_id, &req.message, Some(kernel_handle))
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!("Streaming message failed for agent {id}: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Streaming message failed"})),
-                )
-                    .into_response();
-            }
-        };
+    let (rx, _handle) = match state.kernel.send_message_streaming(
+        agent_id,
+        &req.message,
+        Some(kernel_handle),
+        req.sender_id,
+        req.sender_name,
+        None, // SSE streaming doesn't support image attachments yet
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("Streaming message failed for agent {id}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Streaming message failed"})),
+            )
+                .into_response();
+        }
+    };
 
     let sse_stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
@@ -1221,7 +1524,9 @@ pub async fn send_message_stream(
         }
     });
 
-    Sse::new(sse_stream).into_response()
+    Sse::new(sse_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,18 +1909,24 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
     },
     ChannelMeta {
         name: "feishu", display_name: "Feishu/Lark", icon: "FS",
-        description: "Feishu/Lark Open Platform adapter",
+        description: "Feishu/Lark Open Platform adapter (supports China & International)",
         category: "enterprise", difficulty: "Easy", setup_time: "~3 min",
         quick_setup: "Paste your App ID and App Secret",
         setup_type: "form",
         fields: &[
             ChannelField { key: "app_id", label: "App ID", field_type: FieldType::Text, env_var: None, required: true, placeholder: "cli_abc123", advanced: false },
             ChannelField { key: "app_secret_env", label: "App Secret", field_type: FieldType::Secret, env_var: Some("FEISHU_APP_SECRET"), required: true, placeholder: "abc123...", advanced: false },
+            ChannelField { key: "region", label: "Region", field_type: FieldType::Text, env_var: None, required: false, placeholder: "cn or intl", advanced: false },
+            ChannelField { key: "mode", label: "Receive Mode", field_type: FieldType::Text, env_var: None, required: false, placeholder: "webhook|websocket", advanced: true },
             ChannelField { key: "webhook_port", label: "Webhook Port", field_type: FieldType::Number, env_var: None, required: false, placeholder: "8453", advanced: true },
+            ChannelField { key: "webhook_path", label: "Webhook Path", field_type: FieldType::Text, env_var: None, required: false, placeholder: "/feishu/webhook", advanced: true },
+            ChannelField { key: "verification_token", label: "Verification Token", field_type: FieldType::Text, env_var: None, required: false, placeholder: "verify-token", advanced: true },
+            ChannelField { key: "encrypt_key_env", label: "Encrypt Key", field_type: FieldType::Secret, env_var: Some("FEISHU_ENCRYPT_KEY"), required: false, placeholder: "encrypt-key", advanced: true },
+            ChannelField { key: "bot_names", label: "Bot Names", field_type: FieldType::List, env_var: None, required: false, placeholder: "MyBot, Assistant", advanced: true },
             ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
         ],
-        setup_steps: &["Create an app at open.feishu.cn", "Copy App ID and Secret", "Paste them below"],
-        config_template: "[channels.feishu]\napp_id = \"\"\napp_secret_env = \"FEISHU_APP_SECRET\"",
+        setup_steps: &["Create an app at open.feishu.cn (CN) or open.larksuite.com (International)", "Copy App ID and Secret", "Set region: cn (Feishu) or intl (Lark)"],
+        config_template: "[channels.feishu]\napp_id = \"\"\napp_secret_env = \"FEISHU_APP_SECRET\"\nregion = \"cn\"\nmode = \"websocket\"",
     },
     ChannelMeta {
         name: "dingtalk", display_name: "DingTalk", icon: "DT",
@@ -1631,6 +1942,21 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
         ],
         setup_steps: &["Create a robot in your DingTalk group", "Copy the token and signing secret", "Paste them below"],
         config_template: "[channels.dingtalk]\naccess_token_env = \"DINGTALK_ACCESS_TOKEN\"\nsecret_env = \"DINGTALK_SECRET\"",
+    },
+    ChannelMeta {
+        name: "dingtalk_stream", display_name: "DingTalk Stream", icon: "DS",
+        description: "DingTalk Stream Mode (WebSocket long-connection)",
+        category: "enterprise", difficulty: "Easy", setup_time: "~5 min",
+        quick_setup: "Create an Enterprise Internal App with Stream Mode enabled",
+        setup_type: "form",
+        fields: &[
+            ChannelField { key: "app_key_env", label: "App Key", field_type: FieldType::Secret, env_var: Some("DINGTALK_APP_KEY"), required: true, placeholder: "ding...", advanced: false },
+            ChannelField { key: "app_secret_env", label: "App Secret", field_type: FieldType::Secret, env_var: Some("DINGTALK_APP_SECRET"), required: true, placeholder: "uAn4...", advanced: false },
+            ChannelField { key: "robot_code_env", label: "Robot Code", field_type: FieldType::Text, env_var: Some("DINGTALK_ROBOT_CODE"), required: false, placeholder: "ding... (same as App Key)", advanced: true },
+            ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
+        ],
+        setup_steps: &["Create an Enterprise Internal App in DingTalk Open Platform", "Enable Stream Mode in the app settings", "Add robot capability and configure permissions", "Copy App Key and App Secret below"],
+        config_template: "[channels.dingtalk_stream]\napp_key_env = \"DINGTALK_APP_KEY\"\napp_secret_env = \"DINGTALK_APP_SECRET\"",
     },
     ChannelMeta {
         name: "pumble", display_name: "Pumble", icon: "PB",
@@ -1893,6 +2219,24 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
         setup_steps: &["Enter host and username below", "Optionally add a password"],
         config_template: "[channels.mumble]\nhost = \"\"\nusername = \"openfang\"",
     },
+    ChannelMeta {
+        name: "wecom", display_name: "WeCom", icon: "WC",
+        description: "WeCom (WeChat Work) adapter",
+        category: "messaging", difficulty: "Easy", setup_time: "~3 min",
+        quick_setup: "Enter your Corp ID, Agent ID, and Secret",
+        setup_type: "form",
+        fields: &[
+            ChannelField { key: "corp_id", label: "Corp ID", field_type: FieldType::Text, env_var: None, required: true, placeholder: "wwxxxxx", advanced: false },
+            ChannelField { key: "agent_id", label: "Agent ID", field_type: FieldType::Text, env_var: None, required: true, placeholder: "wwxxxxx", advanced: false },
+            ChannelField { key: "secret_env", label: "Secret", field_type: FieldType::Secret, env_var: Some("WECOM_SECRET"), required: true, placeholder: "secret", advanced: false },
+            ChannelField { key: "token", label: "Callback Token", field_type: FieldType::Text, env_var: None, required: false, placeholder: "callback_token", advanced: true },
+            ChannelField { key: "encoding_aes_key", label: "Encoding AES Key", field_type: FieldType::Text, env_var: None, required: false, placeholder: "encoding_aes_key", advanced: true },
+            ChannelField { key: "webhook_port", label: "Webhook Port", field_type: FieldType::Number, env_var: None, required: false, placeholder: "8454", advanced: true },
+            ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
+        ],
+        setup_steps: &["Create a WeCom application at work.weixin.qq.com", "Get Corp ID, Agent ID, and Secret", "Configure callback URL to your webhook endpoint"],
+        config_template: "[channels.wecom]\ncorp_id = \"\"\nagent_id = \"\"\nsecret_env = \"WECOM_SECRET\"",
+    },
 ];
 
 /// Check if a channel is configured (has a `[channels.xxx]` section in config).
@@ -1921,6 +2265,7 @@ fn is_channel_configured(config: &openfang_types::config::ChannelsConfig, name: 
         "webex" => config.webex.is_some(),
         "feishu" => config.feishu.is_some(),
         "dingtalk" => config.dingtalk.is_some(),
+        "dingtalk_stream" => config.dingtalk_stream.is_some(),
         "pumble" => config.pumble.is_some(),
         "flock" => config.flock.is_some(),
         "twist" => config.twist.is_some(),
@@ -1938,6 +2283,7 @@ fn is_channel_configured(config: &openfang_types::config::ChannelsConfig, name: 
         "gotify" => config.gotify.is_some(),
         "webhook" => config.webhook.is_some(),
         "mumble" => config.mumble.is_some(),
+        "wecom" => config.wecom.is_some(),
         _ => false,
     }
 }
@@ -1999,6 +2345,23 @@ fn build_field_json(
 /// Find a channel definition by name.
 fn find_channel_meta(name: &str) -> Option<&'static ChannelMeta> {
     CHANNEL_REGISTRY.iter().find(|c| c.name == name)
+}
+
+#[cfg(test)]
+mod channel_meta_tests {
+    use super::*;
+
+    #[test]
+    fn feishu_channel_meta_includes_mode_field() {
+        let meta = find_channel_meta("feishu").expect("feishu channel meta should exist");
+        assert!(meta.fields.iter().any(|f| f.key == "mode"));
+    }
+
+    #[test]
+    fn feishu_channel_meta_template_includes_websocket_mode_default() {
+        let meta = find_channel_meta("feishu").expect("feishu channel meta should exist");
+        assert!(meta.config_template.contains("mode = \"websocket\""));
+    }
 }
 
 /// Serialize a channel's config to a JSON Value for pre-populating dashboard forms.
@@ -2143,6 +2506,10 @@ fn channel_config_values(
             .dingtalk
             .as_ref()
             .and_then(|c| serde_json::to_value(c).ok()),
+        "dingtalk_stream" => config
+            .dingtalk_stream
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
         "discourse" => config
             .discourse
             .as_ref()
@@ -2165,6 +2532,10 @@ fn channel_config_values(
             .and_then(|c| serde_json::to_value(c).ok()),
         "linkedin" => config
             .linkedin
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "wecom" => config
+            .wecom
             .as_ref()
             .and_then(|c| serde_json::to_value(c).ok()),
         _ => None,
@@ -2787,15 +3158,21 @@ pub async fn list_templates() -> impl IntoResponse {
                         .to_string_lossy()
                         .to_string();
 
-                    let description = std::fs::read_to_string(&manifest_path)
-                        .ok()
-                        .and_then(|content| toml::from_str::<AgentManifest>(&content).ok())
+                    let manifest_content = std::fs::read_to_string(&manifest_path).ok();
+                    let description = manifest_content
+                        .as_ref()
+                        .and_then(|content| toml::from_str::<AgentManifest>(content).ok())
                         .map(|m| m.description)
                         .unwrap_or_default();
+
+                    // Add category based on template name
+                    let category = get_template_category(&name);
 
                     templates.push(serde_json::json!({
                         "name": name,
                         "description": description,
+                        "category": category,
+                        "manifest_toml": manifest_content.unwrap_or_default(),
                     }));
                 }
             }
@@ -2806,6 +3183,24 @@ pub async fn list_templates() -> impl IntoResponse {
         "templates": templates,
         "total": templates.len(),
     }))
+}
+
+fn get_template_category(name: &str) -> &str {
+    match name {
+        "hello-world" | "assistant" => "General",
+        "researcher" | "analyst" => "Research",
+        "coder" | "debugger" | "devops-lead" => "Development",
+        "writer" | "doc-writer" => "Writing",
+        "ops" | "planner" => "Operations",
+        "architect" | "security-auditor" => "Development",
+        "code-reviewer" | "data-scientist" | "test-engineer" => "Development",
+        "legal-assistant" | "email-assistant" | "social-media" => "Business",
+        "customer-support" | "sales-assistant" | "recruiter" => "Business",
+        "meeting-assistant" => "Business",
+        "translator" | "tutor" | "health-tracker" => "General",
+        "personal-finance" | "travel-planner" | "home-automation" => "General",
+        _ => "General",
+    }
 }
 
 /// GET /api/templates/:name — Get template details.
@@ -2970,15 +3365,19 @@ pub async fn delete_agent_kv_key(
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Check database connectivity
-    let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]));
-    let db_ok = state
-        .kernel
-        .memory
-        .structured_get(shared_id, "__health_check__")
-        .is_ok();
+    // Run the database check on a blocking thread so we never hold the
+    // std::sync::Mutex<Connection> on a tokio worker thread.  This prevents
+    // the health probe from starving the async runtime when the agent loop
+    // is holding the database lock for session saves.
+    let memory = state.kernel.memory.clone();
+    let db_ok = tokio::task::spawn_blocking(move || {
+        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        memory.structured_get(shared_id, "__health_check__").is_ok()
+    })
+    .await
+    .unwrap_or(false);
 
     let status = if db_ok { "ok" } else { "degraded" };
 
@@ -2992,14 +3391,15 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health = state.kernel.supervisor.health();
 
-    let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]));
-    let db_ok = state
-        .kernel
-        .memory
-        .structured_get(shared_id, "__health_check__")
-        .is_ok();
+    let memory = state.kernel.memory.clone();
+    let db_ok = tokio::task::spawn_blocking(move || {
+        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        memory.structured_get(shared_id, "__health_check__").is_ok()
+    })
+    .await
+    .unwrap_or(false);
 
     let config_warnings = state.kernel.config.validate();
     let status = if db_ok { "ok" } else { "degraded" };
@@ -3111,6 +3511,21 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
     let _ = registry.load_all();
 
+    // Snapshot of user-provided overrides for the `config_resolved_count`.
+    // Matches `reload_skills()` fallback order so the count reflects what
+    // agents will actually see.
+    let user_configs = {
+        let override_guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        override_guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| state.kernel.config.skills.clone())
+    };
+
     let skills: Vec<serde_json::Value> = registry
         .list()
         .iter()
@@ -3129,6 +3544,32 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                     serde_json::json!({"type": "local"})
                 }
             };
+
+            // Count how many declared config vars resolve to any source
+            // (user override → env → default). Does NOT fetch secret values;
+            // it only checks presence. Zero-length map → 0/0.
+            let declared = &s.manifest.config;
+            let skill_user_cfg = user_configs.get(&s.manifest.skill.name);
+            let mut resolved = 0usize;
+            for (name, var) in declared.iter() {
+                if skill_user_cfg.and_then(|m| m.get(name)).is_some() {
+                    resolved += 1;
+                    continue;
+                }
+                if let Some(env_name) = var.env.as_ref() {
+                    if std::env::var(env_name)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
+                    {
+                        resolved += 1;
+                        continue;
+                    }
+                }
+                if var.default.as_ref().is_some_and(|d| !d.is_empty()) {
+                    resolved += 1;
+                }
+            }
+
             serde_json::json!({
                 "name": s.manifest.skill.name,
                 "description": s.manifest.skill.description,
@@ -3140,6 +3581,8 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "enabled": s.enabled,
                 "source": source,
                 "has_prompt_context": s.manifest.prompt_context.is_some(),
+                "config_declared_count": declared.len(),
+                "config_resolved_count": resolved,
             })
         })
         .collect();
@@ -3202,6 +3645,15 @@ pub async fn uninstall_skill(
             Json(serde_json::json!({"error": format!("{e}")})),
         ),
     }
+}
+
+/// POST /api/skills/reload — Hot-reload the skill registry from disk.
+///
+/// Called by the CLI after `openfang skill install` to notify the running
+/// daemon that new skill files were added to the skills directory (#752).
+pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.kernel.reload_skills();
+    Json(serde_json::json!({"status": "reloaded"}))
 }
 
 /// GET /api/marketplace/search — Search the FangHub marketplace.
@@ -3275,12 +3727,14 @@ pub async fn clawhub_search(
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
+    let skills_dir = state.kernel.config.home_dir.join("skills");
     match client.search(&query, limit).await {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .results
                 .iter()
                 .map(|e| {
+                    let installed = skills_dir.join(&e.slug).exists();
                     serde_json::json!({
                         "slug": e.slug,
                         "name": e.display_name,
@@ -3288,6 +3742,7 @@ pub async fn clawhub_search(
                         "version": e.version,
                         "score": e.score,
                         "updated_at": e.updated_at,
+                        "installed": installed,
                     })
                 })
                 .collect();
@@ -3352,12 +3807,18 @@ pub async fn clawhub_browse(
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
+    let skills_dir = state.kernel.config.home_dir.join("skills");
     match client.browse(sort, limit, cursor).await {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .items
                 .iter()
-                .map(clawhub_browse_entry_to_json)
+                .map(|entry| {
+                    let mut json = clawhub_browse_entry_to_json(entry);
+                    let installed = skills_dir.join(&entry.slug).exists();
+                    json["installed"] = serde_json::json!(installed);
+                    json
+                })
                 .collect();
             let resp = serde_json::json!({
                 "items": items,
@@ -3513,6 +3974,9 @@ pub async fn clawhub_install(
 
     match client.install(&req.slug, &skills_dir).await {
         Ok(result) => {
+            // Hot-reload so agents see the new skill immediately (#752)
+            state.kernel.reload_skills();
+
             let warnings: Vec<serde_json::Value> = result
                 .warnings
                 .iter()
@@ -3646,12 +4110,18 @@ pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoR
     let items: Vec<serde_json::Value> = instances
         .iter()
         .map(|i| {
+            // Effective agent name: custom instance_name takes priority, otherwise HAND.toml default.
+            let effective_agent_name = i
+                .instance_name
+                .clone()
+                .unwrap_or_else(|| i.agent_name.clone());
             serde_json::json!({
                 "instance_id": i.instance_id,
                 "hand_id": i.hand_id,
+                "instance_name": i.instance_name,
                 "status": format!("{}", i.status),
                 "agent_id": i.agent_id.map(|a| a.to_string()),
-                "agent_name": i.agent_name,
+                "agent_name": effective_agent_name,
                 "activated_at": i.activated_at.to_rfc3339(),
                 "updated_at": i.updated_at.to_rfc3339(),
             })
@@ -3930,7 +4400,9 @@ pub async fn install_hand_deps(
             let combined = format!("{stdout}{stderr}");
             let likely_ok = combined.contains("already installed")
                 || combined.contains("No applicable update")
-                || combined.contains("No available upgrade");
+                || combined.contains("No available upgrade")
+                || combined.contains("already an App at")
+                || combined.contains("is already installed");
             results.push(serde_json::json!({
                 "key": req.key,
                 "status": if likely_ok { "installed" } else { "error" },
@@ -4067,15 +4539,58 @@ pub async fn install_hand(
     }
 }
 
+/// POST /api/hands/upsert — Install or update a hand definition.
+///
+/// Like `install_hand` but overwrites an existing definition with the same ID.
+/// Active instances are NOT automatically restarted — deactivate + reactivate
+/// to pick up the new definition.
+pub async fn upsert_hand(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let toml_content = body["toml_content"].as_str().unwrap_or("");
+    let skill_content = body["skill_content"].as_str().unwrap_or("");
+
+    if toml_content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing toml_content field"})),
+        );
+    }
+
+    match state
+        .kernel
+        .hand_registry
+        .upsert_from_content(toml_content, skill_content)
+    {
+        Ok(def) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": def.id,
+                "name": def.name,
+                "description": def.description,
+                "category": format!("{:?}", def.category),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 /// POST /api/hands/{hand_id}/activate — Activate a hand (spawns agent).
 pub async fn activate_hand(
     State(state): State<Arc<AppState>>,
     Path(hand_id): Path<String>,
     body: Option<Json<openfang_hands::ActivateHandRequest>>,
 ) -> impl IntoResponse {
-    let config = body.map(|b| b.0.config).unwrap_or_default();
+    let (config, instance_name) = match body.map(|b| b.0) {
+        Some(r) => (r.config, r.instance_name),
+        None => (std::collections::HashMap::new(), None),
+    };
 
-    match state.kernel.activate_hand(&hand_id, config) {
+    match state.kernel.activate_hand(&hand_id, config, instance_name) {
         Ok(instance) => {
             // If the hand agent has a non-reactive schedule (autonomous hands),
             // start its background loop so it begins running immediately.
@@ -4099,14 +4614,19 @@ pub async fn activate_hand(
                     }
                 }
             }
+            let effective_agent_name = instance
+                .instance_name
+                .clone()
+                .unwrap_or_else(|| instance.agent_name.clone());
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "instance_id": instance.instance_id,
                     "hand_id": instance.hand_id,
+                    "instance_name": instance.instance_name,
                     "status": format!("{}", instance.status),
                     "agent_id": instance.agent_id.map(|a| a.to_string()),
-                    "agent_name": instance.agent_name,
+                    "agent_name": effective_agent_name,
                     "activated_at": instance.activated_at.to_rfc3339(),
                 })),
             )
@@ -4452,6 +4972,12 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
                         "url": url,
                     })
                 }
+                openfang_types::config::McpTransportEntry::Http { url } => {
+                    serde_json::json!({
+                        "type": "http",
+                        "url": url,
+                    })
+                }
             };
             serde_json::json!({
                 "name": s.name,
@@ -4712,7 +5238,7 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
         && !state.kernel.config.network.shared_secret.is_empty();
 
     let (node_id, listen_address, connected_peers, total_peers) =
-        if let Some(ref peer_node) = state.kernel.peer_node {
+        if let Some(peer_node) = state.kernel.peer_node.get() {
             let registry = peer_node.registry();
             (
                 peer_node.node_id().to_string(),
@@ -4893,10 +5419,8 @@ pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 /// GET /api/budget — Current budget status (limits, spend, % used).
 pub async fn budget_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&state.kernel.config.budget);
+    let budget = state.budget_config.read().await;
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -4905,34 +5429,26 @@ pub async fn update_budget(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // SAFETY: Budget config is updated in-place. Since KernelConfig is behind
-    // an Arc and we only have &self, we use ptr mutation (same pattern as OFP).
-    let config_ptr = &state.kernel.config as *const openfang_types::config::KernelConfig
-        as *mut openfang_types::config::KernelConfig;
-
-    // Apply updates
-    unsafe {
+    {
+        let mut budget = state.budget_config.write().await;
         if let Some(v) = body["max_hourly_usd"].as_f64() {
-            (*config_ptr).budget.max_hourly_usd = v;
+            budget.max_hourly_usd = v;
         }
         if let Some(v) = body["max_daily_usd"].as_f64() {
-            (*config_ptr).budget.max_daily_usd = v;
+            budget.max_daily_usd = v;
         }
         if let Some(v) = body["max_monthly_usd"].as_f64() {
-            (*config_ptr).budget.max_monthly_usd = v;
+            budget.max_monthly_usd = v;
         }
         if let Some(v) = body["alert_threshold"].as_f64() {
-            (*config_ptr).budget.alert_threshold = v.clamp(0.0, 1.0);
+            budget.alert_threshold = v.clamp(0.0, 1.0);
         }
         if let Some(v) = body["default_max_llm_tokens_per_hour"].as_u64() {
-            (*config_ptr).budget.default_max_llm_tokens_per_hour = v;
+            budget.default_max_llm_tokens_per_hour = v;
         }
     }
-
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&state.kernel.config.budget);
+    let budget = state.budget_config.read().await;
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5373,6 +5889,11 @@ pub async fn patch_agent(
     // Persist updated entry to SQLite
     if let Some(entry) = state.kernel.registry.get(agent_id) {
         let _ = state.kernel.memory.save_agent(&entry);
+
+        // Write updated manifest to agent.toml on disk so disk doesn't override
+        // dashboard changes on next boot (#996, #1018).
+        state.kernel.persist_manifest_to_disk(agent_id);
+
         (
             StatusCode::OK,
             Json(
@@ -6924,7 +7445,10 @@ pub async fn set_provider_key(
             })
     };
 
-    // Write to secrets.env file
+    // Store in vault (best-effort — no-op if vault not initialized)
+    state.kernel.store_credential(&env_var, &key);
+
+    // Write to secrets.env file (dual-write for backward compat / vault corruption recovery)
     let secrets_path = state.kernel.config.home_dir.join("secrets.env");
     if let Err(e) = write_secret_env(&secrets_path, &env_var, &key) {
         return (
@@ -6990,8 +7514,8 @@ pub async fn set_provider_key(
                 "\n[default_model]\nprovider = \"{}\"\nmodel = \"{}\"\napi_key_env = \"{}\"\n",
                 name, model_id, env_var
             );
+            backup_config(&config_path);
             if let Ok(existing) = std::fs::read_to_string(&config_path) {
-                // Remove existing [default_model] section if present, then append
                 let cleaned = remove_toml_section(&existing, "default_model");
                 let _ =
                     std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml));
@@ -7091,6 +7615,9 @@ pub async fn delete_provider_key(
             Json(serde_json::json!({"error": "Provider does not require an API key"})),
         );
     }
+
+    // Remove from vault (best-effort)
+    state.kernel.remove_credential(&env_var);
 
     // Remove from secrets.env
     let secrets_path = state.kernel.config.home_dir.join("secrets.env");
@@ -7408,6 +7935,512 @@ pub async fn create_skill(
             "note": "Restart the daemon to load the new skill, or it will be available on next boot."
         })),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Skill config endpoints
+// ---------------------------------------------------------------------------
+//
+// These endpoints expose per-skill runtime variables declared in the skill's
+// SKILL.md frontmatter `config:` section. Resolution order is:
+//
+//   1. user config         (the `[skills.<name>]` section in config.toml)
+//   2. env var              (`var.env`)
+//   3. default              (`var.default`)
+//
+// The GET endpoint always returns secret-looking values redacted. The PUT
+// endpoint atomically rewrites the `[skills.<name>]` section of config.toml
+// and reloads the skill registry so the change takes effect on the next
+// prompt build.
+
+/// Load a skill's declared `config:` map, even if `required` vars are
+/// currently unresolved.
+///
+/// Looking up the live registry doesn't work here because the registry's
+/// load path refuses to insert a skill whose required config var has no
+/// resolvable value — which is exactly the state the user needs to reach
+/// this UI to fix. Instead we read the manifest straight from disk (for
+/// user-installed / workspace skills) or straight from the compile-time
+/// bundled catalog.
+fn load_skill_declared_config(
+    skills_dir: &std::path::Path,
+    skill_name: &str,
+) -> Option<std::collections::HashMap<String, openfang_skills::config_injection::SkillConfigVar>> {
+    // 1. User-installed skill: skills_dir/<name>/skill.toml, falling back to
+    //    SKILL.md frontmatter if no TOML has been generated yet.
+    let skill_dir = skills_dir.join(skill_name);
+    if skill_dir.is_dir() {
+        let toml_path = skill_dir.join("skill.toml");
+        if toml_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&toml_path) {
+                if let Ok(manifest) = toml::from_str::<openfang_skills::SkillManifest>(&text) {
+                    if manifest.skill.name == skill_name {
+                        return Some(manifest.config);
+                    }
+                }
+            }
+        }
+        let skillmd_path = skill_dir.join("SKILL.md");
+        if skillmd_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&skillmd_path) {
+                if let Ok(converted) =
+                    openfang_skills::openclaw_compat::convert_skillmd_str(skill_name, &text)
+                {
+                    return Some(converted.config_vars);
+                }
+            }
+        }
+    }
+
+    // 2. Bundled skill: look up by name in the compile-time catalog.
+    for (bundled_name, content) in openfang_skills::bundled::bundled_skills() {
+        if bundled_name == skill_name {
+            if let Ok(converted) =
+                openfang_skills::openclaw_compat::convert_skillmd_str(bundled_name, content)
+            {
+                return Some(converted.config_vars);
+            }
+        }
+    }
+
+    None
+}
+
+/// Build the per-skill config state for the GET endpoint.
+///
+/// Returns `None` if the skill is not installed. Resolved values are
+/// redacted when the variable name looks secret (see
+/// [`openfang_skills::config_injection::is_secret_name`]).
+fn build_skill_config_snapshot(
+    state: &Arc<AppState>,
+    skill_name: &str,
+) -> Option<serde_json::Value> {
+    use openfang_skills::config_injection::is_secret_name;
+
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let declared = load_skill_declared_config(&skills_dir, skill_name)?;
+
+    // Snapshot the currently active user config (override map takes priority
+    // over the boot-time `self.config.skills`, matching what `reload_skills`
+    // will actually use).
+    let user_cfg: std::collections::HashMap<String, String> = {
+        let override_guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let source: &std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+            override_guard.as_ref().unwrap_or(&state.kernel.config.skills);
+        source.get(skill_name).cloned().unwrap_or_default()
+    };
+
+    let mut declared_json = serde_json::Map::new();
+    let mut resolved_json = serde_json::Map::new();
+
+    for (name, var) in declared.iter() {
+        declared_json.insert(
+            name.clone(),
+            serde_json::json!({
+                "description": var.description,
+                "env": var.env,
+                "default": var.default,
+                "required": var.required,
+            }),
+        );
+
+        let is_secret = is_secret_name(name);
+        let (value_opt, source) = if let Some(v) = user_cfg.get(name) {
+            (Some(v.clone()), "user")
+        } else if let Some(env_name) = var.env.as_ref() {
+            match std::env::var(env_name) {
+                Ok(v) if !v.is_empty() => (Some(v), "env"),
+                _ => {
+                    if let Some(d) = var.default.as_ref() {
+                        (Some(d.clone()), "default")
+                    } else {
+                        (None, "unresolved")
+                    }
+                }
+            }
+        } else if let Some(d) = var.default.as_ref() {
+            (Some(d.clone()), "default")
+        } else {
+            (None, "unresolved")
+        };
+
+        // Redact secrets for the wire response.
+        let shown_value: serde_json::Value = match value_opt {
+            Some(v) if is_secret => {
+                let prefix: String = v.chars().take(4).collect();
+                if prefix.is_empty() {
+                    serde_json::Value::String("***redacted***".to_string())
+                } else {
+                    serde_json::Value::String(format!("{prefix}***redacted***"))
+                }
+            }
+            Some(v) => serde_json::Value::String(v),
+            None => serde_json::Value::Null,
+        };
+
+        resolved_json.insert(
+            name.clone(),
+            serde_json::json!({
+                "value": shown_value,
+                "source": source,
+                "is_secret": is_secret,
+            }),
+        );
+    }
+
+    Some(serde_json::json!({
+        "skill": skill_name,
+        "declared": serde_json::Value::Object(declared_json),
+        "resolved": serde_json::Value::Object(resolved_json),
+    }))
+}
+
+/// GET /api/skills/{id}/config — Return declared + resolved per-skill config.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "skill": "github-helper",
+///   "declared": {
+///     "github_token": { "description": "...", "env": "GH_TOKEN", "default": null, "required": true }
+///   },
+///   "resolved": {
+///     "github_token": { "value": "ghp_***redacted***", "source": "user", "is_secret": true }
+///   }
+/// }
+/// ```
+///
+/// Secret-looking values (`*_token`, `*_key`, `*_secret`, `password`) are
+/// always redacted in the `value` field. The `source` field names the layer
+/// that won: `"user"`, `"env"`, `"default"`, or `"unresolved"`.
+pub async fn get_skill_config(
+    State(state): State<Arc<AppState>>,
+    Path(skill_name): Path<String>,
+) -> impl IntoResponse {
+    match build_skill_config_snapshot(&state, &skill_name) {
+        Some(snapshot) => (StatusCode::OK, Json(snapshot)),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+        ),
+    }
+}
+
+/// Request body for `PUT /api/skills/{id}/config`.
+#[derive(Debug, serde::Deserialize)]
+pub struct SkillConfigPutRequest {
+    /// New per-variable values. Keys must match declared variable names.
+    pub values: std::collections::HashMap<String, String>,
+}
+
+/// PUT /api/skills/{id}/config — Write user overrides for a skill's config.
+///
+/// The body is `{"values": {"<var_name>": "<value>"}}`. Only declared
+/// variables are accepted; unknown keys return 400. After the config.toml is
+/// atomically rewritten, the kernel's skill registry is reloaded so the
+/// change takes effect immediately.
+pub async fn put_skill_config(
+    State(state): State<Arc<AppState>>,
+    Path(skill_name): Path<String>,
+    Json(body): Json<SkillConfigPutRequest>,
+) -> impl IntoResponse {
+    // Refuse to operate on unknown skill (matching GET behavior). We read
+    // the declared config directly instead of going through the registry so
+    // a skill with required-but-unresolved vars is still editable.
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let declared = match load_skill_declared_config(&skills_dir, &skill_name) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+            );
+        }
+    };
+
+    // Reject unknown keys.
+    for k in body.values.keys() {
+        if !declared.contains_key(k) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Variable '{k}' is not declared by skill '{skill_name}'")
+                })),
+            );
+        }
+    }
+
+    // Build the final in-memory skill-configs map: start from the current
+    // override (or boot-time config), replace the skill's section with the
+    // incoming values.
+    let mut all_configs: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = {
+        let guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| state.kernel.config.skills.clone())
+    };
+    all_configs.insert(skill_name.clone(), body.values.clone());
+
+    // Persist atomically to config.toml.
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = upsert_skill_config(&config_path, &skill_name, &body.values) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to persist skill config: {e}")
+            })),
+        );
+    }
+
+    // Reload so agents see the new config on their next prompt build.
+    state.kernel.reload_skills_with_configs(all_configs);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "saved",
+            "skill": skill_name,
+            "reloaded": true,
+        })),
+    )
+}
+
+/// DELETE /api/skills/{id}/config/{var_name} — Remove a single user override.
+///
+/// After removal, the variable falls back to env or default on the next
+/// prompt build. If removing the override would leave a `required` variable
+/// with no resolvable value, the request fails with 409 Conflict so the
+/// caller is never tricked into a broken state.
+pub async fn delete_skill_config_var(
+    State(state): State<Arc<AppState>>,
+    Path((skill_name, var_name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let declared = match load_skill_declared_config(&skills_dir, &skill_name) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Skill '{skill_name}' not found")})),
+            );
+        }
+    };
+
+    let var_def = match declared.get(&var_name) {
+        Some(v) => v.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Variable '{var_name}' is not declared by skill '{skill_name}'")
+                })),
+            );
+        }
+    };
+
+    // If the var is required, make sure env or default still resolves;
+    // otherwise we would leave the skill unable to register after reload.
+    if var_def.required {
+        let env_resolves = var_def
+            .env
+            .as_ref()
+            .and_then(|e| std::env::var(e).ok())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let default_resolves = var_def
+            .default
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !env_resolves && !default_resolves {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Cannot remove override: '{var_name}' is required and has no env/default fallback"
+                    )
+                })),
+            );
+        }
+    }
+
+    let mut all_configs: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = {
+        let guard = state
+            .kernel
+            .skill_config_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| state.kernel.config.skills.clone())
+    };
+    if let Some(skill_map) = all_configs.get_mut(&skill_name) {
+        skill_map.remove(&var_name);
+        if skill_map.is_empty() {
+            all_configs.remove(&skill_name);
+        }
+    }
+
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = remove_skill_config_var(&config_path, &skill_name, &var_name) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to update config.toml: {e}")
+            })),
+        );
+    }
+
+    state.kernel.reload_skills_with_configs(all_configs);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "removed",
+            "skill": skill_name,
+            "var": var_name,
+            "reloaded": true,
+        })),
+    )
+}
+
+/// Atomically upsert `[skills.<skill_name>]` in config.toml.
+///
+/// Writes to `<path>.tmp` then renames — so a crash during the write never
+/// leaves a half-truncated config on disk. Existing root-level fields are
+/// preserved; only the named skill's section is replaced.
+fn upsert_skill_config(
+    config_path: &std::path::Path,
+    skill_name: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
+
+    if !root.contains_key("skills") {
+        root.insert(
+            "skills".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let skills_table = root
+        .get_mut("skills")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("skills is not a table")?;
+
+    let mut skill_section = toml::map::Map::new();
+    for (k, v) in values {
+        skill_section.insert(k.clone(), toml::Value::String(v.clone()));
+    }
+    skills_table.insert(skill_name.to_string(), toml::Value::Table(skill_section));
+
+    atomic_write_toml(config_path, &doc)?;
+    Ok(())
+}
+
+/// Atomically remove a single variable from `[skills.<skill_name>]`.
+///
+/// If the skill table becomes empty the table itself is removed so we don't
+/// leave empty sections lying around.
+fn remove_skill_config_var(
+    config_path: &std::path::Path,
+    skill_name: &str,
+    var_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(config_path)?;
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut doc: toml::Value = toml::from_str(&content)?;
+
+    let root = match doc.as_table_mut() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let mut remove_skill = false;
+    if let Some(skills_table) = root.get_mut("skills").and_then(|v| v.as_table_mut()) {
+        if let Some(skill_section) = skills_table.get_mut(skill_name).and_then(|v| v.as_table_mut())
+        {
+            skill_section.remove(var_name);
+            if skill_section.is_empty() {
+                remove_skill = true;
+            }
+        }
+        if remove_skill {
+            skills_table.remove(skill_name);
+        }
+    }
+
+    atomic_write_toml(config_path, &doc)?;
+    Ok(())
+}
+
+/// Write a TOML value to disk atomically via a sibling temp file + rename.
+///
+/// On Windows, `rename` is atomic on the same volume when the destination
+/// does not exist; if it does we fall back to the non-atomic write path and
+/// still cover the "crash mid-write truncates config.toml" class of bug.
+fn atomic_write_toml(
+    config_path: &std::path::Path,
+    doc: &toml::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let rendered = toml::to_string_pretty(doc)?;
+    let tmp_path = match config_path.file_name() {
+        Some(name) => {
+            let mut tmp_name = std::ffi::OsString::from(".");
+            tmp_name.push(name);
+            tmp_name.push(".tmp");
+            config_path.with_file_name(tmp_name)
+        }
+        None => config_path.with_extension("tmp"),
+    };
+    std::fs::write(&tmp_path, rendered)?;
+    match std::fs::rename(&tmp_path, config_path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Fallback: direct write, then best-effort cleanup of temp.
+            let rendered = toml::to_string_pretty(doc)?;
+            std::fs::write(config_path, rendered)?;
+            let _ = std::fs::remove_file(&tmp_path);
+            Ok(())
+        }
+    }
 }
 
 // ── Helper functions for secrets.env management ────────────────────────
@@ -7836,40 +8869,70 @@ pub async fn reload_integrations(State(state): State<Arc<AppState>>) -> impl Int
 // ---------------------------------------------------------------------------
 // Scheduled Jobs (cron) endpoints
 // ---------------------------------------------------------------------------
+//
+// Historical note: an earlier implementation of `/api/schedules*` wrote to a
+// shared-memory key (`__openfang_schedules`) that no executor ever read — so
+// scheduled jobs registered via this API never actually fired (#1069). These
+// routes now delegate to the kernel's real cron scheduler, which already
+// backs `/api/cron/jobs*`. The request/response shape has been preserved as
+// close as possible to the legacy route for dashboard compatibility.
 
-/// The well-known shared-memory agent ID used for cross-agent KV storage.
-/// Must match the value in `openfang-kernel/src/kernel.rs::shared_memory_agent_id()`.
-fn schedule_shared_agent_id() -> AgentId {
-    AgentId(uuid::Uuid::from_bytes([
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01,
-    ]))
+/// Convert an internal `CronJob` into the legacy `/api/schedules` response
+/// shape so existing dashboard code keeps working.
+fn cron_job_to_schedule_view(
+    kernel: &OpenFangKernel,
+    job: &openfang_types::scheduler::CronJob,
+) -> serde_json::Value {
+    use openfang_types::scheduler::{CronAction, CronSchedule};
+
+    let cron = match &job.schedule {
+        CronSchedule::Cron { expr, .. } => expr.clone(),
+        CronSchedule::Every { every_secs } => format!("every {every_secs}s"),
+        CronSchedule::At { at } => at.to_rfc3339(),
+    };
+    let message = match &job.action {
+        CronAction::AgentTurn { message, .. } => message.clone(),
+        CronAction::SystemEvent { text } => text.clone(),
+        CronAction::WorkflowRun { workflow_id, .. } => format!("workflow:{workflow_id}"),
+    };
+    let meta = kernel.cron_scheduler.get_meta(job.id);
+    let last_status = meta.as_ref().and_then(|m| m.last_status.clone());
+    // Serialize delivery_targets so dashboard chips/editor round-trip cleanly.
+    let delivery_targets = serde_json::to_value(&job.delivery_targets)
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+
+    serde_json::json!({
+        "id": job.id.to_string(),
+        "name": job.name,
+        "cron": cron,
+        "agent_id": job.agent_id.to_string(),
+        "message": message,
+        "enabled": job.enabled,
+        "created_at": job.created_at.to_rfc3339(),
+        "last_run": job.last_run.map(|t| t.to_rfc3339()),
+        "next_run": job.next_run.map(|t| t.to_rfc3339()),
+        "last_status": last_status,
+        "delivery_targets": delivery_targets,
+    })
 }
 
-const SCHEDULES_KEY: &str = "__openfang_schedules";
-
-/// GET /api/schedules — List all cron-based scheduled jobs.
+/// GET /api/schedules — List all scheduled jobs from the cron scheduler.
 pub async fn list_schedules(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let agent_id = schedule_shared_agent_id();
-    match state.kernel.memory.structured_get(agent_id, SCHEDULES_KEY) {
-        Ok(Some(serde_json::Value::Array(arr))) => {
-            let total = arr.len();
-            Json(serde_json::json!({"schedules": arr, "total": total}))
-        }
-        Ok(_) => Json(serde_json::json!({"schedules": [], "total": 0})),
-        Err(e) => {
-            tracing::warn!("Failed to load schedules: {e}");
-            Json(serde_json::json!({"schedules": [], "total": 0, "error": format!("{e}")}))
-        }
-    }
+    let jobs = state.kernel.cron_scheduler.list_all_jobs();
+    let total = jobs.len();
+    let schedules: Vec<serde_json::Value> = jobs
+        .iter()
+        .map(|j| cron_job_to_schedule_view(&state.kernel, j))
+        .collect();
+    Json(serde_json::json!({"schedules": schedules, "total": total}))
 }
 
-/// POST /api/schedules — Create a new cron-based scheduled job.
+/// POST /api/schedules — Create a new scheduled job in the cron scheduler.
 pub async fn create_schedule(
     State(state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let name = match req["name"].as_str() {
+    let name_raw = match req["name"].as_str() {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => {
             return (
@@ -7889,7 +8952,6 @@ pub async fn create_schedule(
         }
     };
 
-    // Validate cron expression: must be 5 space-separated fields
     let cron_parts: Vec<&str> = cron.split_whitespace().collect();
     if cron_parts.len() != 5 {
         return (
@@ -7907,166 +8969,263 @@ pub async fn create_schedule(
             Json(serde_json::json!({"error": "Missing required field: agent_id"})),
         );
     }
-    // Validate agent exists (UUID or name lookup)
-    let agent_exists = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-        state.kernel.registry.get(aid).is_some()
+    let target_agent = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
+        if state.kernel.registry.get(aid).is_some() {
+            Some(aid)
+        } else {
+            None
+        }
     } else {
         state
             .kernel
             .registry
             .list()
-            .iter()
-            .any(|a| a.name == agent_id_str)
+            .into_iter()
+            .find(|a| a.name == agent_id_str)
+            .map(|a| a.id)
     };
-    if !agent_exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Agent not found: {agent_id_str}")})),
-        );
-    }
+    let target_agent = match target_agent {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Agent not found: {agent_id_str}")})),
+            );
+        }
+    };
+
     let message = req["message"].as_str().unwrap_or("").to_string();
     let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let job_message = if message.is_empty() {
+        format!("[Scheduled task '{name_raw}']")
+    } else {
+        message.clone()
+    };
 
-    let schedule_id = uuid::Uuid::new_v4().to_string();
-    let entry = serde_json::json!({
-        "id": schedule_id,
-        "name": name,
-        "cron": cron,
-        "agent_id": agent_id_str,
-        "message": message,
-        "enabled": enabled,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "last_run": null,
-        "run_count": 0,
-    });
-
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    schedules.push(entry.clone());
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        tracing::warn!("Failed to save schedule: {e}");
+    // Accept multi-destination delivery targets. Validate each entry matches
+    // the `CronDeliveryTarget` shape up front so we return a 400 rather than
+    // silently dropping targets or failing later in the kernel.
+    let delivery_targets_raw = req
+        .get("delivery_targets")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if !delivery_targets_raw.is_null() && !delivery_targets_raw.is_array() {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save schedule: {e}")})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "delivery_targets must be an array"
+            })),
         );
     }
+    if let Some(arr) = delivery_targets_raw.as_array() {
+        for (idx, t) in arr.iter().enumerate() {
+            if let Err(e) = serde_json::from_value::<
+                openfang_types::scheduler::CronDeliveryTarget,
+            >(t.clone())
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("delivery_targets[{idx}] invalid: {e}")
+                    })),
+                );
+            }
+        }
+    }
 
-    (StatusCode::CREATED, Json(entry))
+    let mut job_json = serde_json::json!({
+        "name": sanitize_schedule_job_name(&name_raw),
+        "schedule": { "kind": "cron", "expr": cron, "tz": null },
+        "action": {
+            "kind": "agent_turn",
+            "message": job_message,
+            "model_override": null,
+            "timeout_secs": null,
+        },
+        "delivery": { "kind": "none" },
+        "one_shot": false,
+    });
+    if let Some(arr) = delivery_targets_raw.as_array() {
+        job_json["delivery_targets"] = serde_json::Value::Array(arr.clone());
+    }
+
+    match state
+        .kernel
+        .cron_create(&target_agent.to_string(), job_json)
+        .await
+    {
+        Ok(resp) => {
+            let job_id = serde_json::from_str::<serde_json::Value>(&resp)
+                .ok()
+                .and_then(|v| v["job_id"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            if !enabled {
+                if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+                    let _ = state.kernel.cron_scheduler.set_enabled(cj_id, false);
+                    let _ = state.kernel.cron_scheduler.persist();
+                }
+            }
+            // Build response in the legacy shape.
+            let body = if let Ok(uuid) = uuid::Uuid::parse_str(&job_id) {
+                let cj_id = openfang_types::scheduler::CronJobId(uuid);
+                match state.kernel.cron_scheduler.get_job(cj_id) {
+                    Some(job) => cron_job_to_schedule_view(&state.kernel, &job),
+                    None => serde_json::json!({
+                        "id": job_id,
+                        "name": name_raw,
+                        "cron": cron,
+                        "agent_id": target_agent.to_string(),
+                        "message": message,
+                        "enabled": enabled,
+                    }),
+                }
+            } else {
+                serde_json::json!({
+                    "id": job_id,
+                    "name": name_raw,
+                    "cron": cron,
+                    "agent_id": target_agent.to_string(),
+                    "message": message,
+                    "enabled": enabled,
+                })
+            };
+            (StatusCode::CREATED, Json(body))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Failed to create schedule: {e}")})),
+        ),
+    }
 }
 
-/// PUT /api/schedules/:id — Update a scheduled job (toggle enabled, edit fields).
+/// PUT /api/schedules/:id — Update a scheduled job.
+///
+/// Supports toggling `enabled`. Other fields are not mutable without a
+/// delete+recreate (the underlying cron scheduler does not expose in-place
+/// edits); those are accepted but ignored with a note in the response.
 pub async fn update_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let mut found = false;
-    for s in schedules.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            found = true;
-            if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-                s["enabled"] = serde_json::Value::Bool(enabled);
-            }
-            if let Some(name) = req.get("name").and_then(|v| v.as_str()) {
-                s["name"] = serde_json::Value::String(name.to_string());
-            }
-            if let Some(cron) = req.get("cron").and_then(|v| v.as_str()) {
-                let cron_parts: Vec<&str> = cron.split_whitespace().collect();
-                if cron_parts.len() != 5 {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "Invalid cron expression"})),
-                    );
-                }
-                s["cron"] = serde_json::Value::String(cron.to_string());
-            }
-            if let Some(agent_id) = req.get("agent_id").and_then(|v| v.as_str()) {
-                s["agent_id"] = serde_json::Value::String(agent_id.to_string());
-            }
-            if let Some(message) = req.get("message").and_then(|v| v.as_str()) {
-                s["message"] = serde_json::Value::String(message.to_string());
-            }
-            break;
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
         }
-    }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
 
-    if !found {
+    if state.kernel.cron_scheduler.get_job(cj_id).is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Schedule not found"})),
         );
     }
 
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to update schedule: {e}")})),
-        );
+    let mut note: Option<&'static str> = None;
+    if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
+        if let Err(e) = state.kernel.cron_scheduler.set_enabled(cj_id, enabled) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+        let _ = state.kernel.cron_scheduler.persist();
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "updated", "schedule_id": id})),
-    )
+    // Apply a full replacement of delivery_targets when supplied. Validation
+    // is done up front via serde so a bad entry produces a 400 rather than
+    // silently replacing the list with the valid subset.
+    if let Some(raw_targets) = req.get("delivery_targets") {
+        if !raw_targets.is_array() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "delivery_targets must be an array"})),
+            );
+        }
+        let arr = raw_targets.as_array().unwrap();
+        let mut parsed: Vec<openfang_types::scheduler::CronDeliveryTarget> =
+            Vec::with_capacity(arr.len());
+        for (idx, t) in arr.iter().enumerate() {
+            match serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(
+                t.clone(),
+            ) {
+                Ok(dt) => parsed.push(dt),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("delivery_targets[{idx}] invalid: {e}")
+                        })),
+                    );
+                }
+            }
+        }
+        if let Err(e) = state
+            .kernel
+            .cron_scheduler
+            .set_delivery_targets(cj_id, parsed)
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            );
+        }
+        let _ = state.kernel.cron_scheduler.persist();
+    }
+
+    if req.get("name").is_some()
+        || req.get("cron").is_some()
+        || req.get("agent_id").is_some()
+        || req.get("message").is_some()
+    {
+        note = Some("Only 'enabled' and 'delivery_targets' are mutable; delete and recreate to change other fields.");
+    }
+
+    let mut body = serde_json::json!({"status": "updated", "schedule_id": id});
+    if let Some(n) = note {
+        body["note"] = serde_json::Value::String(n.to_string());
+    }
+    // Echo the new view so callers can confirm without a second GET.
+    if let Some(job) = state.kernel.cron_scheduler.get_job(cj_id) {
+        body["schedule"] = cron_job_to_schedule_view(&state.kernel, &job);
+    }
+    (StatusCode::OK, Json(body))
 }
 
-/// DELETE /api/schedules/:id — Remove a scheduled job.
+/// DELETE /api/schedules/:id — Remove a scheduled job from the cron scheduler.
 pub async fn delete_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let before = schedules.len();
-    schedules.retain(|s| s["id"].as_str() != Some(&id));
-
-    if schedules.len() == before {
-        return (
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
+        }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+    match state.kernel.cron_scheduler.remove_job(cj_id) {
+        Ok(_) => {
+            let _ = state.kernel.cron_scheduler.persist();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "removed", "schedule_id": id})),
+            )
+        }
+        Err(_) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Schedule not found"})),
-        );
+        ),
     }
-
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete schedule: {e}")})),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "removed", "schedule_id": id})),
-    )
 }
 
 /// POST /api/schedules/:id/run — Manually run a scheduled job now.
@@ -8074,101 +9233,41 @@ pub async fn run_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let schedule = match schedules.iter().find(|s| s["id"].as_str() == Some(&id)) {
-        Some(s) => s.clone(),
-        None => {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
+        }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+    let job = match state.kernel.cron_scheduler.try_claim_for_run(cj_id) {
+        Ok(j) => j,
+        Err(openfang_kernel::cron::ClaimError::NotFound) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Schedule not found"})),
             );
         }
-    };
-
-    let agent_id_str = schedule["agent_id"].as_str().unwrap_or("");
-    let message = schedule["message"]
-        .as_str()
-        .unwrap_or("Scheduled task triggered manually.");
-    let name = schedule["name"].as_str().unwrap_or("(unnamed)");
-
-    // Find the target agent — require explicit agent_id, no silent fallback
-    let target_agent = if !agent_id_str.is_empty() {
-        if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-            if state.kernel.registry.get(aid).is_some() {
-                Some(aid)
-            } else {
-                None
-            }
-        } else {
-            state
-                .kernel
-                .registry
-                .list()
-                .iter()
-                .find(|a| a.name == agent_id_str)
-                .map(|a| a.id)
-        }
-    } else {
-        None
-    };
-
-    let target_agent = match target_agent {
-        Some(a) => a,
-        None => {
+        Err(openfang_kernel::cron::ClaimError::Disabled) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(
-                    serde_json::json!({"error": "No target agent found. Specify an agent_id or start an agent first."}),
-                ),
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Schedule is disabled"})),
             );
         }
     };
 
-    let run_message = if message.is_empty() {
-        format!("[Scheduled task '{}' triggered manually]", name)
-    } else {
-        message.to_string()
-    };
-
-    // Update last_run and run_count
-    let mut schedules_updated: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-    for s in schedules_updated.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            s["last_run"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-            let count = s["run_count"].as_u64().unwrap_or(0);
-            s["run_count"] = serde_json::json!(count + 1);
-            break;
-        }
-    }
-    let _ = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules_updated),
-    );
-
-    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state
-        .kernel
-        .send_message_with_handle(target_agent, &run_message, Some(kernel_handle))
-        .await
-    {
-        Ok(result) => (
+    let agent_id_str = job.agent_id.to_string();
+    match state.kernel.cron_run_job(&job).await {
+        Ok(response) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "completed",
                 "schedule_id": id,
-                "agent_id": target_agent.to_string(),
-                "response": result.response,
+                "agent_id": agent_id_str,
+                "response": response,
             })),
         ),
         Err(e) => (
@@ -8180,6 +9279,73 @@ pub async fn run_schedule(
             })),
         ),
     }
+}
+
+/// GET /api/schedules/{id}/delivery-log — Return the last N per-target
+/// delivery results for a schedule.
+///
+/// Delivery results are not yet persisted across runs, so this endpoint
+/// returns an empty list for jobs that exist. A future change can back this
+/// with a ring buffer populated by `cron_fan_out_targets`. The endpoint is
+/// wired up now so the dashboard can call it without a placeholder.
+pub async fn schedule_delivery_log(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid schedule id"})),
+            );
+        }
+    };
+    let cj_id = openfang_types::scheduler::CronJobId(uuid);
+    let job = match state.kernel.cron_scheduler.get_job(cj_id) {
+        Some(j) => j,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Schedule not found"})),
+            );
+        }
+    };
+    // Delivery history is not yet persisted; surface the target list with
+    // empty result arrays so the UI has stable shape to render.
+    let targets: Vec<serde_json::Value> = job
+        .delivery_targets
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schedule_id": id,
+            "targets": targets,
+            "entries": [],
+        })),
+    )
+}
+
+/// Sanitize a user-supplied schedule name into a valid `CronJob.name`.
+/// Matches the kernel's own sanitizer used by the migration path.
+fn sanitize_schedule_job_name(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = filtered.trim();
+    if trimmed.is_empty() {
+        return "schedule".to_string();
+    }
+    trimmed.chars().take(128).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -8457,20 +9623,16 @@ pub async fn patch_agent_config(
         if !new_model.is_empty() {
             if let Some(ref new_provider) = req.provider {
                 if !new_provider.is_empty() {
-                    // Explicit provider given — use it directly
-                    if state
-                        .kernel
-                        .registry
-                        .update_model_and_provider(
-                            agent_id,
-                            new_model.clone(),
-                            new_provider.clone(),
-                        )
-                        .is_err()
+                    // Explicit provider given — still route through set_agent_model
+                    // so provider-specific auth/env hints stay in sync.
+                    if let Err(e) =
+                        state
+                            .kernel
+                            .set_agent_model(agent_id, new_model, Some(new_provider))
                     {
                         return (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({"error": "Agent not found"})),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": format!("{e}")})),
                         );
                     }
                 } else {
@@ -8515,6 +9677,10 @@ pub async fn patch_agent_config(
             tracing::warn!("Failed to persist agent config update: {e}");
         }
     }
+
+    // Write updated manifest to agent.toml on disk so disk doesn't override
+    // dashboard changes on next boot (#996, #1018).
+    state.kernel.persist_manifest_to_disk(agent_id);
 
     (
         StatusCode::OK,
@@ -8610,6 +9776,11 @@ pub async fn clone_agent(
         .kernel
         .registry
         .update_identity(new_id, source.identity.clone());
+
+    // Register in channel router so binding resolution finds the cloned agent
+    if let Some(ref mgr) = *state.bridge_manager.lock().await {
+        mgr.router().register_agent(req.new_name.clone(), new_id);
+    }
 
     (
         StatusCode::CREATED,
@@ -8939,16 +10110,14 @@ fn is_allowed_content_type(ct: &str) -> bool {
 
 /// POST /api/agents/{id}/upload — Upload a file attachment.
 ///
-/// Accepts raw body bytes. The client must set:
-/// - `Content-Type` header (e.g., `image/png`, `text/plain`, `application/pdf`)
-/// - `X-Filename` header (original filename)
+/// Accepts multipart/form-data. The client must include a file field with:
+/// - `Content-Type` field (e.g., `image/png`, `text/plain`, `application/pdf`)
+/// - `filename` attribute (original filename)
 pub async fn upload_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    mut multipart: Multipart,
 ) -> impl IntoResponse {
-    // Validate agent ID format
     let _agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
@@ -8959,12 +10128,62 @@ pub async fn upload_file(
         }
     };
 
-    // Extract content type
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    let mut file_data: Option<(Option<String>, String, axum::body::Bytes)> = None;
+    let mut filename_from_field: Option<String> = None;
+
+    while let Some(field) = multipart.next_field().await.transpose() {
+        let field = match field {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Failed to read field: {}", e)})),
+                );
+            }
+        };
+
+        let field_name = field.name().unwrap_or("").to_string();
+
+        match field_name.as_str() {
+            "file" => {
+                let filename_attr = field.file_name().map(|s| s.to_string());
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let bytes = match field.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(
+                                serde_json::json!({"error": format!("Failed to read file: {}", e)}),
+                            ),
+                        );
+                    }
+                };
+                file_data = Some((filename_attr, content_type, bytes));
+            }
+            "filename" => {
+                filename_from_field = field.text().await.ok();
+            }
+            _ => {}
+        }
+    }
+
+    let (filename_attr, content_type, body) = match file_data {
+        Some(data) => data,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "No file provided"})),
+            );
+        }
+    };
+
+    let filename = filename_from_field
+        .or(filename_attr)
+        .unwrap_or_else(|| "upload".to_string());
 
     if !is_allowed_content_type(&content_type) {
         return (
@@ -8974,13 +10193,6 @@ pub async fn upload_file(
             ),
         );
     }
-
-    // Extract filename from header
-    let filename = headers
-        .get("X-Filename")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("upload")
-        .to_string();
 
     // Validate size
     if body.len() > MAX_UPLOAD_SIZE {
@@ -9126,25 +10338,28 @@ pub async fn serve_upload(Path(file_id): Path<String>) -> impl IntoResponse {
 // Execution Approval System — backed by kernel.approval_manager
 // ---------------------------------------------------------------------------
 
-/// GET /api/approvals — List pending approval requests.
+/// GET /api/approvals — List pending and recent approval requests.
 ///
 /// Transforms field names to match the dashboard template expectations:
 /// `action_summary` → `action`, `agent_id` → `agent_name`, `requested_at` → `created_at`.
 pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pending = state.kernel.approval_manager.list_pending();
-    let total = pending.len();
+    let recent = state.kernel.approval_manager.list_recent(50);
 
     // Resolve agent names for display
     let registry_agents = state.kernel.registry.list();
+    let agent_name_for = |agent_id: &str| {
+        registry_agents
+            .iter()
+            .find(|ag| ag.id.to_string() == agent_id || ag.name == agent_id)
+            .map(|ag| ag.name.clone())
+            .unwrap_or_else(|| agent_id.to_string())
+    };
 
-    let approvals: Vec<serde_json::Value> = pending
+    let mut approvals: Vec<serde_json::Value> = pending
         .into_iter()
         .map(|a| {
-            let agent_name = registry_agents
-                .iter()
-                .find(|ag| ag.id.to_string() == a.agent_id || ag.name == a.agent_id)
-                .map(|ag| ag.name.as_str())
-                .unwrap_or(&a.agent_id);
+            let agent_name = agent_name_for(&a.agent_id);
             serde_json::json!({
                 "id": a.id,
                 "agent_id": a.agent_id,
@@ -9161,6 +10376,42 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
             })
         })
         .collect();
+
+    approvals.extend(recent.into_iter().map(|record| {
+        let request = record.request;
+        let agent_name = agent_name_for(&request.agent_id);
+        let status = match record.decision {
+            openfang_types::approval::ApprovalDecision::Approved => "approved",
+            openfang_types::approval::ApprovalDecision::Denied => "rejected",
+            openfang_types::approval::ApprovalDecision::TimedOut => "expired",
+        };
+        serde_json::json!({
+            "id": request.id,
+            "agent_id": request.agent_id,
+            "agent_name": agent_name,
+            "tool_name": request.tool_name,
+            "description": request.description,
+            "action_summary": request.action_summary,
+            "action": request.action_summary,
+            "risk_level": request.risk_level,
+            "requested_at": request.requested_at,
+            "created_at": request.requested_at,
+            "timeout_secs": request.timeout_secs,
+            "status": status,
+            "decided_at": record.decided_at,
+            "decided_by": record.decided_by,
+        })
+    }));
+
+    approvals.sort_by(|a, b| {
+        let a_pending = a["status"].as_str() == Some("pending");
+        let b_pending = b["status"].as_str() == Some("pending");
+        b_pending
+            .cmp(&a_pending)
+            .then_with(|| b["created_at"].as_str().cmp(&a["created_at"].as_str()))
+    });
+
+    let total = approvals.len();
 
     Json(serde_json::json!({"approvals": approvals, "total": total}))
 }
@@ -9348,78 +10599,84 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .collect();
     drop(catalog);
 
+    // Helper: normalize field definitions to objects with {name, type, label}
+    // so the frontend template can iterate and render inputs correctly.
+    let f = |name: &str, ftype: &str, label: &str| -> serde_json::Value {
+        serde_json::json!({"name": name, "type": ftype, "label": label})
+    };
+
     Json(serde_json::json!({
         "sections": {
             "general": {
                 "root_level": true,
-                "fields": {
-                    "api_listen": "string",
-                    "api_key": "string",
-                    "log_level": "string"
-                }
+                "fields": [
+                    f("api_listen", "string", "API Listen Address"),
+                    f("api_key", "string", "API Key"),
+                    f("log_level", "string", "Log Level")
+                ]
             },
             "default_model": {
                 "hot_reloadable": true,
-                "fields": {
-                    "provider": { "type": "select", "options": provider_options },
-                    "model": { "type": "select", "options": model_options },
-                    "api_key_env": "string",
-                    "base_url": "string"
-                }
+                "fields": [
+                    { "name": "provider", "type": "select", "label": "Provider", "options": provider_options },
+                    { "name": "model", "type": "select", "label": "Model", "options": model_options },
+                    f("api_key_env", "string", "API Key Env Var"),
+                    f("base_url", "string", "Base URL")
+                ]
             },
             "memory": {
-                "fields": {
-                    "decay_rate": "number",
-                    "vector_dims": "number"
-                }
+                "fields": [
+                    f("decay_rate", "number", "Decay Rate"),
+                    f("vector_dims", "number", "Vector Dimensions")
+                ]
             },
             "web": {
-                "fields": {
-                    "provider": "string",
-                    "timeout_secs": "number",
-                    "max_results": "number"
-                }
+                "fields": [
+                    f("provider", "string", "Search Provider"),
+                    f("timeout_secs", "number", "Timeout (seconds)"),
+                    f("max_results", "number", "Max Results")
+                ]
             },
             "browser": {
-                "fields": {
-                    "headless": "boolean",
-                    "timeout_secs": "number",
-                    "executable_path": "string"
-                }
+                "fields": [
+                    f("headless", "boolean", "Headless Mode"),
+                    f("timeout_secs", "number", "Timeout (seconds)"),
+                    f("executable_path", "string", "Chrome/Chromium Path")
+                ]
             },
             "network": {
-                "fields": {
-                    "enabled": "boolean",
-                    "listen_addr": "string",
-                    "shared_secret": "string"
-                }
+                "fields": [
+                    f("enabled", "boolean", "Enable OFP Network"),
+                    f("listen_addr", "string", "Listen Address"),
+                    f("shared_secret", "string", "Shared Secret")
+                ]
             },
             "extensions": {
-                "fields": {
-                    "auto_connect": "boolean",
-                    "health_check_interval_secs": "number"
-                }
+                "fields": [
+                    f("auto_connect", "boolean", "Auto Connect"),
+                    f("health_check_interval_secs", "number", "Health Check Interval (s)")
+                ]
             },
             "vault": {
-                "fields": {
-                    "path": "string"
-                }
+                "fields": [
+                    f("path", "string", "Vault Path")
+                ]
             },
             "a2a": {
-                "fields": {
-                    "enabled": "boolean",
-                    "name": "string",
-                    "description": "string",
-                    "url": "string"
-                }
+                "fields": [
+                    f("enabled", "boolean", "Enable A2A"),
+                    f("name", "string", "Agent Name"),
+                    f("description", "string", "Description"),
+                    f("url", "string", "URL")
+                ]
             },
             "channels": {
-                "fields": {
-                    "telegram": "object",
-                    "discord": "object",
-                    "slack": "object",
-                    "whatsapp": "object"
-                }
+                "fields": [
+                    f("telegram", "object", "Telegram"),
+                    f("discord", "object", "Discord"),
+                    f("slack", "object", "Slack"),
+                    f("whatsapp", "object", "WhatsApp")
+                ]
             }
         }
     }))
@@ -9753,6 +11010,66 @@ pub async fn cron_job_status(
             Json(serde_json::json!({"error": "Invalid job ID"})),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Run cron job on demand
+// ---------------------------------------------------------------------------
+
+/// POST /api/cron/jobs/{id}/run — Trigger a cron job immediately.
+///
+/// Returns `{"status": "triggered", "job_id": "..."}` and spawns the execution
+/// in the background.  The job's status can be polled via
+/// `GET /api/cron/jobs/{id}/status`.
+pub async fn run_cron_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "error": "Invalid job ID"})),
+            );
+        }
+    };
+    let job_id = openfang_types::scheduler::CronJobId(uuid);
+
+    // Atomically check existence + enabled + reserve next_run in one lock hold.
+    let job = match state.kernel.cron_scheduler.try_claim_for_run(job_id) {
+        Ok(j) => j,
+        Err(openfang_kernel::cron::ClaimError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"status": "error", "error": "Job not found"})),
+            );
+        }
+        Err(openfang_kernel::cron::ClaimError::Disabled) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "error": "Job is disabled"})),
+            );
+        }
+    };
+
+    // Spawn execution in the background so we don't block the HTTP response.
+    let kernel = Arc::clone(&state.kernel);
+    let job_name = job.name.clone();
+    tokio::spawn(async move {
+        match kernel.cron_run_job(&job).await {
+            Ok(_) => tracing::info!(job = %job_name, "On-demand cron job completed"),
+            Err(e) => tracing::warn!(job = %job_name, error = %e, "On-demand cron job failed"),
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "triggered",
+            "job_id": id,
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -10108,37 +11425,82 @@ pub async fn pairing_notify(
         .into_response()
 }
 
-/// GET /api/commands — List available chat commands (for dynamic slash menu).
-pub async fn list_commands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut commands = vec![
-        serde_json::json!({"cmd": "/help", "desc": "Show available commands"}),
-        serde_json::json!({"cmd": "/new", "desc": "Reset session (clear history)"}),
-        serde_json::json!({"cmd": "/compact", "desc": "Trigger LLM session compaction"}),
-        serde_json::json!({"cmd": "/model", "desc": "Show or switch model (/model [name])"}),
-        serde_json::json!({"cmd": "/stop", "desc": "Cancel current agent run"}),
-        serde_json::json!({"cmd": "/usage", "desc": "Show session token usage & cost"}),
-        serde_json::json!({"cmd": "/think", "desc": "Toggle extended thinking (/think [on|off|stream])"}),
-        serde_json::json!({"cmd": "/context", "desc": "Show context window usage & pressure"}),
-        serde_json::json!({"cmd": "/verbose", "desc": "Cycle tool detail level (/verbose [off|on|full])"}),
-        serde_json::json!({"cmd": "/queue", "desc": "Check if agent is processing"}),
-        serde_json::json!({"cmd": "/status", "desc": "Show system status"}),
-        serde_json::json!({"cmd": "/clear", "desc": "Clear chat display"}),
-        serde_json::json!({"cmd": "/exit", "desc": "Disconnect from agent"}),
-    ];
+/// GET /api/commands?surface=web|cli|channel|all — List slash commands from the
+/// unified command registry, filtered by surface.
+///
+/// Query params:
+///   - `surface`: one of `web` (default), `cli`, `channel`, `all`.
+///
+/// Returns:
+/// ```json
+/// {
+///   "surface": "web",
+///   "commands": [
+///     {
+///       "name": "new",
+///       "aliases": ["reset"],
+///       "description": "Reset session (clear history)",
+///       "category": "session",
+///       "requires_agent": true
+///     },
+///     ...
+///   ]
+/// }
+/// ```
+///
+/// Unknown surface values return 400.
+pub async fn list_commands(Query(params): Query<CommandsQuery>) -> impl IntoResponse {
+    use openfang_types::commands::{self, CommandCategory, Surfaces};
 
-    // Add skill-registered tool names as potential commands
-    if let Ok(registry) = state.kernel.skill_registry.read() {
-        for skill in registry.list() {
-            let desc: String = skill.manifest.skill.description.chars().take(80).collect();
-            commands.push(serde_json::json!({
-                "cmd": format!("/{}", skill.manifest.skill.name),
-                "desc": if desc.is_empty() { format!("Skill: {}", skill.manifest.skill.name) } else { desc },
-                "source": "skill",
-            }));
+    let surface_raw = params.surface.as_deref().unwrap_or("web");
+    let surface = match surface_raw.to_ascii_lowercase().as_str() {
+        "web" => Surfaces::WEB,
+        "cli" => Surfaces::CLI,
+        "channel" => Surfaces::CHANNEL,
+        "all" => Surfaces::ALL,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Unknown surface '{other}'. Valid: web, cli, channel, all."
+                    ),
+                })),
+            )
+                .into_response();
         }
-    }
+    };
 
-    Json(serde_json::json!({"commands": commands}))
+    let category_slug = |c: CommandCategory| -> &'static str {
+        match c {
+            CommandCategory::General => "general",
+            CommandCategory::Session => "session",
+            CommandCategory::Model => "model",
+            CommandCategory::Memory => "memory",
+            CommandCategory::Control => "control",
+            CommandCategory::Info => "info",
+            CommandCategory::Automation => "automation",
+            CommandCategory::Monitoring => "monitoring",
+        }
+    };
+
+    let commands: Vec<serde_json::Value> = commands::list_for_surface(surface)
+        .map(|def| {
+            serde_json::json!({
+                "name": def.name,
+                "aliases": def.aliases,
+                "description": def.description,
+                "category": category_slug(def.category),
+                "requires_agent": def.requires_agent,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "surface": surface_raw.to_ascii_lowercase(),
+        "commands": commands,
+    }))
+    .into_response()
 }
 
 /// SECURITY: Validate webhook bearer token using constant-time comparison.
@@ -10253,7 +11615,10 @@ pub async fn copilot_oauth_poll(
             Json(serde_json::json!({"status": "pending"})),
         ),
         openfang_runtime::copilot_oauth::DeviceFlowStatus::Complete { access_token } => {
-            // Save to secrets.env
+            // Store in vault (best-effort)
+            state.kernel.store_credential("GITHUB_TOKEN", &access_token);
+
+            // Save to secrets.env (dual-write)
             let secrets_path = state.kernel.config.home_dir.join("secrets.env");
             if let Err(e) = write_secret_env(&secrets_path, "GITHUB_TOKEN", &access_token) {
                 return (
@@ -10726,7 +12091,161 @@ pub async fn comms_task(
     }
 }
 
+// ── Dashboard Authentication (username/password sessions) ──
+
+/// POST /api/auth/login — Authenticate with username/password, returns session token.
+pub async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::response::Response;
+
+    let auth_cfg = &state.kernel.config.auth;
+    if !auth_cfg.enabled {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": "Auth not enabled"}).to_string(),
+            ))
+            .unwrap();
+    }
+
+    let username = req.get("username").and_then(|v| v.as_str()).unwrap_or("");
+    let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Constant-time username comparison to prevent timing attacks
+    let username_ok = {
+        use subtle::ConstantTimeEq;
+        let stored = auth_cfg.username.as_bytes();
+        let provided = username.as_bytes();
+        if stored.len() != provided.len() {
+            false
+        } else {
+            bool::from(stored.ct_eq(provided))
+        }
+    };
+
+    if !username_ok || !crate::session_auth::verify_password(password, &auth_cfg.password_hash) {
+        // Audit log the failed attempt
+        state.kernel.audit_log.record(
+            "system",
+            openfang_runtime::audit::AuditAction::AuthAttempt,
+            "dashboard login failed",
+            format!("username: {username}"),
+        );
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": "Invalid credentials"}).to_string(),
+            ))
+            .unwrap();
+    }
+
+    // Derive the session secret the same way as server.rs
+    let api_key = state.kernel.config.api_key.trim().to_string();
+    let secret = if !api_key.is_empty() {
+        api_key
+    } else {
+        auth_cfg.password_hash.clone()
+    };
+
+    let token =
+        crate::session_auth::create_session_token(username, &secret, auth_cfg.session_ttl_hours);
+    let ttl_secs = auth_cfg.session_ttl_hours * 3600;
+    let cookie =
+        format!("openfang_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl_secs}");
+
+    state.kernel.audit_log.record(
+        "system",
+        openfang_runtime::audit::AuditAction::AuthAttempt,
+        "dashboard login success",
+        format!("username: {username}"),
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("set-cookie", &cookie)
+        .body(Body::from(
+            serde_json::json!({
+                "status": "ok",
+                "token": token,
+                "username": username,
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// POST /api/auth/logout — Clear the session cookie.
+pub async fn auth_logout() -> impl IntoResponse {
+    let cookie = "openfang_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
+    (
+        StatusCode::OK,
+        [("content-type", "application/json"), ("set-cookie", cookie)],
+        serde_json::json!({"status": "ok"}).to_string(),
+    )
+}
+
+/// GET /api/auth/check — Check current authentication state.
+pub async fn auth_check(
+    State(state): State<Arc<AppState>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let auth_cfg = &state.kernel.config.auth;
+    if !auth_cfg.enabled {
+        return Json(serde_json::json!({
+            "authenticated": true,
+            "mode": "none",
+        }));
+    }
+
+    // Derive the session secret the same way as server.rs
+    let api_key = state.kernel.config.api_key.trim().to_string();
+    let secret = if !api_key.is_empty() {
+        api_key
+    } else {
+        auth_cfg.password_hash.clone()
+    };
+
+    // Check session cookie
+    let session_user = request
+        .headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|c| {
+                c.trim()
+                    .strip_prefix("openfang_session=")
+                    .map(|v| v.to_string())
+            })
+        })
+        .and_then(|token| crate::session_auth::verify_session_token(&token, &secret));
+
+    if let Some(username) = session_user {
+        Json(serde_json::json!({
+            "authenticated": true,
+            "mode": "session",
+            "username": username,
+        }))
+    } else {
+        Json(serde_json::json!({
+            "authenticated": false,
+            "mode": "session",
+        }))
+    }
+}
+
 /// Remove a `[section]` and its contents from a TOML string.
+#[allow(dead_code)]
+fn backup_config(config_path: &std::path::Path) {
+    let backup = config_path.with_extension("toml.bak");
+    let _ = std::fs::copy(config_path, backup);
+}
+
 fn remove_toml_section(content: &str, section: &str) -> String {
     let header = format!("[{}]", section);
     let mut result = String::new();
@@ -10746,4 +12265,182 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod channel_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_channel_configured_wecom_none() {
+        let config = openfang_types::config::ChannelsConfig::default();
+        assert!(!is_channel_configured(&config, "wecom"));
+    }
+
+    #[test]
+    fn test_is_channel_configured_wecom_some() {
+        let mut config = openfang_types::config::ChannelsConfig::default();
+        config.wecom = Some(openfang_types::config::WeComConfig {
+            corp_id: "test_corp".to_string(),
+            agent_id: "test_agent".to_string(),
+            secret_env: "WECOM_SECRET".to_string(),
+            webhook_port: 8454,
+            token: Some("token".to_string()),
+            encoding_aes_key: Some("aes_key".to_string()),
+            default_agent: Some("assistant".to_string()),
+            overrides: openfang_types::config::ChannelOverrides::default(),
+        });
+        assert!(is_channel_configured(&config, "wecom"));
+    }
+
+    #[test]
+    fn test_wecom_in_channel_registry() {
+        let wecom_meta = CHANNEL_REGISTRY.iter().find(|c| c.name == "wecom");
+        assert!(wecom_meta.is_some());
+        let meta = wecom_meta.unwrap();
+        assert_eq!(meta.display_name, "WeCom");
+        assert_eq!(meta.category, "messaging");
+        assert!(
+            meta.fields
+                .iter()
+                .find(|f| f.key == "corp_id")
+                .unwrap()
+                .required
+        );
+        assert!(
+            meta.fields
+                .iter()
+                .find(|f| f.key == "secret_env")
+                .unwrap()
+                .required
+        );
+    }
+}
+
+#[cfg(test)]
+mod skill_config_tests {
+    //! Unit tests for the `/api/skills/{id}/config` endpoints.
+    //!
+    //! These exercise the on-disk TOML writer and the in-memory snapshot
+    //! builder directly. Live end-to-end coverage (real HTTP, real kernel)
+    //! lives in `tests/skill_config_api_test.rs`.
+
+    use super::*;
+
+    fn sample_values() -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("github_token".to_string(), "ghp_test1234".to_string());
+        m.insert("default_branch".to_string(), "develop".to_string());
+        m
+    }
+
+    #[test]
+    fn upsert_creates_skills_section_from_blank_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        upsert_skill_config(&path, "demo-skill", &sample_values()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[skills.demo-skill]"), "text was: {text}");
+        assert!(text.contains("github_token = \"ghp_test1234\""));
+        assert!(text.contains("default_branch = \"develop\""));
+    }
+
+    #[test]
+    fn upsert_preserves_other_root_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "log_level = \"debug\"\napi_listen = \"127.0.0.1:4200\"\n",
+        )
+        .unwrap();
+
+        upsert_skill_config(&path, "demo-skill", &sample_values()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("log_level"), "log_level lost: {text}");
+        assert!(text.contains("api_listen"), "api_listen lost: {text}");
+        assert!(text.contains("[skills.demo-skill]"));
+    }
+
+    #[test]
+    fn upsert_replaces_existing_section_wholesale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[skills.demo-skill]\nold_key = \"old_value\"\nshared = \"before\"\n",
+        )
+        .unwrap();
+
+        let mut new_values = std::collections::HashMap::new();
+        new_values.insert("shared".to_string(), "after".to_string());
+        upsert_skill_config(&path, "demo-skill", &new_values).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("old_key"), "old_key not dropped: {text}");
+        assert!(text.contains("shared = \"after\""));
+    }
+
+    #[test]
+    fn remove_drops_single_var_but_keeps_table_when_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        upsert_skill_config(&path, "demo-skill", &sample_values()).unwrap();
+
+        remove_skill_config_var(&path, "demo-skill", "github_token").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("github_token"));
+        assert!(text.contains("default_branch"));
+        assert!(text.contains("[skills.demo-skill]"));
+    }
+
+    #[test]
+    fn remove_last_var_removes_whole_skill_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut single = std::collections::HashMap::new();
+        single.insert("only".to_string(), "x".to_string());
+        upsert_skill_config(&path, "demo-skill", &single).unwrap();
+
+        remove_skill_config_var(&path, "demo-skill", "only").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("demo-skill"),
+            "empty section not cleaned up: {text}"
+        );
+    }
+
+    #[test]
+    fn remove_missing_file_is_silent_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // File does not exist — must not error.
+        remove_skill_config_var(&path, "demo-skill", "github_token").unwrap();
+    }
+
+    #[test]
+    fn atomic_write_produces_valid_toml_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut doc = toml::map::Map::new();
+        let mut skills = toml::map::Map::new();
+        let mut inner = toml::map::Map::new();
+        inner.insert(
+            "github_token".to_string(),
+            toml::Value::String("ghp_xyz".to_string()),
+        );
+        skills.insert("demo".to_string(), toml::Value::Table(inner));
+        doc.insert("skills".to_string(), toml::Value::Table(skills));
+        let doc = toml::Value::Table(doc);
+
+        atomic_write_toml(&path, &doc).unwrap();
+
+        let back: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back, doc);
+    }
 }

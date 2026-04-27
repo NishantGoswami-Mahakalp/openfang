@@ -4,6 +4,8 @@
 //! Replaces the scattered `push_str` prompt injection throughout the codebase
 //! with a single, testable, ordered prompt builder.
 
+use crate::str_utils::safe_truncate_str;
+
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
 pub struct PromptContext {
@@ -55,6 +57,15 @@ pub struct PromptContext {
     pub peer_agents: Vec<(String, String, String)>,
     /// Current date/time string for temporal awareness.
     pub current_date: Option<String>,
+    /// Sender identity (e.g. WhatsApp phone number, Telegram user ID).
+    pub sender_id: Option<String>,
+    /// Sender display name.
+    pub sender_name: Option<String>,
+    /// Current on-disk `context.md` content for the agent (see `agent_context`).
+    ///
+    /// Read per-turn by the kernel so external writers (cron jobs, integrations)
+    /// are reflected in the next LLM call. See issue #843.
+    pub context_md: Option<String>,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -148,6 +159,15 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
+    // Section 9.1 — Sender Identity (skip for subagents)
+    if !ctx.is_subagent {
+        if let Some(sender_line) =
+            build_sender_section(ctx.sender_name.as_deref(), ctx.sender_id.as_deref())
+        {
+            sections.push(sender_line);
+        }
+    }
+
     // Section 9.5 — Peer Agent Awareness (skip for subagents)
     if !ctx.is_subagent && !ctx.peer_agents.is_empty() {
         sections.push(build_peer_agents_section(&ctx.agent_name, &ctx.peer_agents));
@@ -186,6 +206,19 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             if !ws_ctx.trim().is_empty() {
                 sections.push(cap_str(ws_ctx, 1000));
             }
+        }
+    }
+
+    // Section 15 — Live agent context (`context.md`). Re-read per turn so
+    // external writers (e.g. cron jobs refreshing live data) show up on the
+    // very next message. See issue #843.
+    if let Some(ref live) = ctx.context_md {
+        let trimmed = live.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!(
+                "## Live Context\nThe following context is refreshed from `context.md` each turn and may change between messages.\n\n{}",
+                cap_str(trimmed, 8000)
+            ));
         }
     }
 
@@ -275,12 +308,18 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 ///
 /// Also used by `agent_loop.rs` to append recalled memories after DB lookup.
 pub fn build_memory_section(memories: &[(String, String)]) -> String {
-    let mut out = String::from(
-        "## Memory\n\
-         - When the user asks about something from a previous conversation, use memory_recall first.\n\
-         - Store important preferences, decisions, and context with memory_store for future use.",
-    );
-    if !memories.is_empty() {
+    let mut out = String::from("## Memory\n");
+    if memories.is_empty() {
+        out.push_str(
+            "- When the user asks about something from a previous conversation, use memory_recall first.\n\
+             - Store important preferences, decisions, and context with memory_store for future use.",
+        );
+    } else {
+        out.push_str(
+            "- Use the recalled memories below to inform your responses.\n\
+             - Only call memory_recall if you need information not already shown here.\n\
+             - Store important preferences, decisions, and context with memory_store for future use.",
+        );
         out.push_str("\n\nRecalled memories:\n");
         for (key, content) in memories.iter().take(5) {
             let capped = cap_str(content, 500);
@@ -411,6 +450,15 @@ fn build_channel_section(channel: &str) -> String {
          You are responding via {channel}. Keep messages under {limit} chars.\n\
          {hints}"
     )
+}
+
+fn build_sender_section(sender_name: Option<&str>, sender_id: Option<&str>) -> Option<String> {
+    match (sender_name, sender_id) {
+        (Some(name), Some(id)) => Some(format!("## Sender\nMessage from: {name} ({id})")),
+        (Some(name), None) => Some(format!("## Sender\nMessage from: {name}")),
+        (None, Some(id)) => Some(format!("## Sender\nMessage from: {id}")),
+        (None, None) => None,
+    }
 }
 
 fn build_peer_agents_section(self_name: &str, peers: &[(String, String, String)]) -> String {
@@ -599,7 +647,7 @@ fn cap_str(s: &str, max_chars: usize) -> String {
             .nth(max_chars)
             .map(|(i, _)| i)
             .unwrap_or(s.len());
-        format!("{}...", &s[..end])
+        safe_truncate_str(s, end).to_string() + "..."
     }
 }
 
@@ -728,7 +776,7 @@ mod tests {
     fn test_memory_section_empty() {
         let section = build_memory_section(&[]);
         assert!(section.contains("## Memory"));
-        assert!(section.contains("memory_recall"));
+        assert!(section.contains("use memory_recall first"));
         assert!(!section.contains("Recalled memories"));
     }
 
@@ -742,6 +790,8 @@ mod tests {
         assert!(section.contains("Recalled memories"));
         assert!(section.contains("[pref] User likes dark mode"));
         assert!(section.contains("[ctx] Working on Rust project"));
+        assert!(section.contains("Use the recalled memories below"));
+        assert!(!section.contains("use memory_recall first"));
     }
 
     #[test]
@@ -895,6 +945,28 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("You are helper"));
         assert!(prompt.contains("A helpful agent"));
+    }
+
+    #[test]
+    fn test_context_md_section_included() {
+        let mut ctx = basic_ctx();
+        ctx.context_md = Some("BTCUSD: 67000\nETHUSD: 3400".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Live Context"));
+        assert!(prompt.contains("BTCUSD: 67000"));
+        assert!(prompt.contains("ETHUSD: 3400"));
+    }
+
+    #[test]
+    fn test_context_md_section_omitted_when_empty_or_none() {
+        let mut ctx = basic_ctx();
+        ctx.context_md = None;
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Live Context"));
+
+        ctx.context_md = Some("   \n\n   ".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Live Context"));
     }
 
     #[test]

@@ -42,6 +42,12 @@ pub struct MessageRequest {
     /// Optional file attachments (uploaded via /upload endpoint).
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
+    /// Sender identity (e.g. WhatsApp phone number, Telegram user ID).
+    #[serde(default)]
+    pub sender_id: Option<String>,
+    /// Sender display name.
+    #[serde(default)]
+    pub sender_name: Option<String>,
 }
 
 /// Response from sending a message.
@@ -100,4 +106,12 @@ pub struct MigrateScanRequest {
 pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
+}
+
+/// Query parameters for `GET /api/commands`.
+#[derive(Debug, Deserialize)]
+pub struct CommandsQuery {
+    /// Surface filter: `web` (default), `cli`, `channel`, or `all`.
+    #[serde(default)]
+    pub surface: Option<String>,
 }

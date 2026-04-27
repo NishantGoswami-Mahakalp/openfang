@@ -23,6 +23,8 @@ pub enum ChannelType {
     Mattermost,
     WebChat,
     CLI,
+    /// MQTT pub/sub messaging.
+    Mqtt,
     Custom(String),
 }
 
@@ -267,6 +269,15 @@ pub trait ChannelAdapter: Send + Sync {
         _thread_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.send(user, content).await
+    }
+
+    /// Whether this adapter should suppress sending internal agent errors back to the user.
+    ///
+    /// Returns `true` for public broadcast channels (e.g. Mastodon) where posting
+    /// an error message would create a public status update. Errors are always
+    /// logged regardless of this setting.
+    fn suppress_error_responses(&self) -> bool {
+        false
     }
 }
 

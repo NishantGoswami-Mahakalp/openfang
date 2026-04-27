@@ -356,6 +356,14 @@ fn estimate_cost_rates(model: &str) -> (f64, f64) {
         return (0.20, 0.90);
     }
 
+    // ── NVIDIA NIM ──────────────────────────────────────────────
+    if model.contains("nemotron-4-340b") {
+        return (4.20, 4.20);
+    }
+    if model.contains("nemotron") {
+        return (0.88, 0.88);
+    }
+
     // ── Open-source (Groq, Together, etc.) ─────────────────────
     if model.contains("llama-4-maverick") {
         return (0.50, 0.77);
@@ -385,6 +393,9 @@ fn estimate_cost_rates(model: &str) -> (f64, f64) {
 
     // ── MiniMax ──────────────────────────────────────────────────
     if model.contains("minimax") || model.contains("abab") {
+        if model.contains("m2.7") {
+            return (0.30, 1.20);
+        }
         if model.contains("highspeed") {
             return (0.80, 3.20);
         }

@@ -122,6 +122,15 @@ pub enum CronAction {
         /// Timeout in seconds (10..=600).
         timeout_secs: Option<u64>,
     },
+    /// Run a workflow by ID or name.
+    WorkflowRun {
+        /// Workflow UUID or name (resolved by name if not a valid UUID).
+        workflow_id: String,
+        /// Initial input to the workflow (default: empty).
+        input: Option<String>,
+        /// Timeout in seconds (10..=3600, default: 120).
+        timeout_secs: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +160,53 @@ pub enum CronDelivery {
 }
 
 // ---------------------------------------------------------------------------
+// CronDeliveryTarget (multi-destination fan-out)
+// ---------------------------------------------------------------------------
+
+/// A single destination for multi-destination cron output fan-out.
+///
+/// A cron job may declare zero or more `CronDeliveryTarget`s on its
+/// `delivery_targets` field. When the job fires and produces output, the
+/// delivery engine sends the same output to every target concurrently.
+/// Failures in one target do not abort delivery to the others.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CronDeliveryTarget {
+    /// Deliver via an existing channel adapter (Telegram/Slack/Discord/etc.).
+    Channel {
+        /// Which adapter to use (e.g. `"telegram"`, `"slack"`).
+        channel_type: String,
+        /// Platform-specific recipient (chat ID, user ID, etc.).
+        recipient: String,
+    },
+    /// Deliver via HTTP POST to a webhook URL with a JSON payload.
+    Webhook {
+        /// Destination URL (`http://` or `https://`).
+        url: String,
+        /// Optional `Authorization` header value sent verbatim.
+        #[serde(default)]
+        auth_header: Option<String>,
+    },
+    /// Append or overwrite a local file on disk.
+    LocalFile {
+        /// Absolute or relative path to the output file.
+        path: String,
+        /// If `true`, append to the file; if `false`, overwrite.
+        #[serde(default)]
+        append: bool,
+    },
+    /// Deliver via the existing email channel adapter.
+    Email {
+        /// Recipient email address.
+        to: String,
+        /// Optional subject template (e.g. `"Cron: {job}"`). Literal `{job}`
+        /// placeholders are replaced with the job name at send time.
+        #[serde(default)]
+        subject_template: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // CronJob
 // ---------------------------------------------------------------------------
 
@@ -169,8 +225,12 @@ pub struct CronJob {
     pub schedule: CronSchedule,
     /// What to do when fired.
     pub action: CronAction,
-    /// Where to deliver the result.
+    /// Where to deliver the result (single legacy destination).
     pub delivery: CronDelivery,
+    /// Additional fan-out destinations. May be empty; each target is
+    /// delivered concurrently after the job produces its output.
+    #[serde(default)]
+    pub delivery_targets: Vec<CronDeliveryTarget>,
     /// When the job was created.
     pub created_at: DateTime<Utc>,
     /// When the job last fired (if ever).
@@ -299,6 +359,34 @@ impl CronJob {
                     }
                 }
             }
+            CronAction::WorkflowRun {
+                workflow_id,
+                input,
+                timeout_secs,
+            } => {
+                if workflow_id.is_empty() {
+                    return Err("workflow_id must not be empty".into());
+                }
+                if let Some(i) = input {
+                    if i.len() > MAX_TURN_MESSAGE_LEN {
+                        return Err(format!(
+                            "workflow input too long ({} chars, max {MAX_TURN_MESSAGE_LEN})",
+                            i.len()
+                        ));
+                    }
+                }
+                if let Some(t) = timeout_secs {
+                    if *t < MIN_TIMEOUT_SECS {
+                        return Err(format!(
+                            "timeout_secs too small ({t}, min {MIN_TIMEOUT_SECS})"
+                        ));
+                    }
+                    // Workflows can run longer than agent turns (max 3600s = 1h)
+                    if *t > 3600 {
+                        return Err(format!("timeout_secs too large ({t}, max 3600)"));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -387,6 +475,7 @@ mod tests {
                 text: "ping".into(),
             },
             delivery: CronDelivery::None,
+            delivery_targets: Vec::new(),
             created_at: Utc::now(),
             last_run: None,
             next_run: None,
@@ -863,5 +952,105 @@ mod tests {
             tz: None,
         };
         assert!(job.validate(0).is_ok());
+    }
+
+    // -- Action: WorkflowRun --
+
+    #[test]
+    fn workflow_run_valid() {
+        let mut job = valid_job();
+        job.action = CronAction::WorkflowRun {
+            workflow_id: "my-report-pipeline".into(),
+            input: Some("generate daily metrics".into()),
+            timeout_secs: Some(300),
+        };
+        assert!(job.validate(0).is_ok());
+    }
+
+    #[test]
+    fn workflow_run_empty_id() {
+        let mut job = valid_job();
+        job.action = CronAction::WorkflowRun {
+            workflow_id: String::new(),
+            input: None,
+            timeout_secs: None,
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("workflow_id"), "{err}");
+    }
+
+    #[test]
+    fn workflow_run_input_too_long() {
+        let mut job = valid_job();
+        job.action = CronAction::WorkflowRun {
+            workflow_id: "test".into(),
+            input: Some("x".repeat(16_385)),
+            timeout_secs: None,
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn workflow_run_timeout_too_small() {
+        let mut job = valid_job();
+        job.action = CronAction::WorkflowRun {
+            workflow_id: "test".into(),
+            input: None,
+            timeout_secs: Some(9),
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("too small"), "{err}");
+    }
+
+    #[test]
+    fn workflow_run_timeout_too_large() {
+        let mut job = valid_job();
+        job.action = CronAction::WorkflowRun {
+            workflow_id: "test".into(),
+            input: None,
+            timeout_secs: Some(3601),
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn workflow_run_max_timeout_ok() {
+        let mut job = valid_job();
+        job.action = CronAction::WorkflowRun {
+            workflow_id: "test".into(),
+            input: None,
+            timeout_secs: Some(3600),
+        };
+        assert!(job.validate(0).is_ok());
+    }
+
+    #[test]
+    fn workflow_run_no_input_ok() {
+        let mut job = valid_job();
+        job.action = CronAction::WorkflowRun {
+            workflow_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            input: None,
+            timeout_secs: None,
+        };
+        assert!(job.validate(0).is_ok());
+    }
+
+    #[test]
+    fn serde_workflow_run_tag() {
+        let action = CronAction::WorkflowRun {
+            workflow_id: "my-wf".into(),
+            input: Some("go".into()),
+            timeout_secs: Some(60),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"kind\":\"workflow_run\""));
+        let back: CronAction = serde_json::from_str(&json).unwrap();
+        if let CronAction::WorkflowRun { workflow_id, .. } = back {
+            assert_eq!(workflow_id, "my-wf");
+        } else {
+            panic!("expected WorkflowRun variant");
+        }
     }
 }

@@ -186,6 +186,12 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to a user on a named channel adapter (e.g., "email", "telegram").
     /// When `thread_id` is provided, the message is sent as a thread reply.
     /// Returns a confirmation string on success.
+    /// Get the default recipient for a channel (e.g. default_chat_id for Telegram).
+    async fn get_channel_default_recipient(&self, channel: &str) -> Option<String> {
+        let _ = channel;
+        None
+    }
+
     async fn send_channel_message(
         &self,
         channel: &str,
@@ -230,6 +236,12 @@ pub trait KernelHandle: Send + Sync {
     ) -> Result<String, String> {
         let _ = (channel, recipient, data, filename, mime_type, thread_id);
         Err("Channel file data send not available".to_string())
+    }
+
+    /// Refresh an agent's last_active timestamp without changing any other state.
+    /// Called by the agent loop before long LLM calls to prevent heartbeat false-positives.
+    fn touch_agent(&self, agent_id: &str) {
+        let _ = agent_id;
     }
 
     /// Spawn an agent with capability inheritance enforcement.
